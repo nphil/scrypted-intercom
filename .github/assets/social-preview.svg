@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="scrypted-intercom">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="#1d2733"/>
+      <stop offset="1" stop-color="#0b0f14"/>
+    </linearGradient>
+    <linearGradient id="iris" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#4ae3a1"/>
+      <stop offset="1" stop-color="#1b9df0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="#0e131a"/>
+  <rect width="1280" height="640" fill="url(#bg)" opacity="0.9"/>
+
+  <!-- mark, scaled from the icon -->
+  <g transform="translate(104 152) scale(0.78)">
+    <g fill="none" stroke="#4ae3a1" stroke-linecap="round" stroke-width="22">
+      <path d="M336 200 A 80 80 0 0 1 336 312"/>
+      <path d="M386 168 A 132 132 0 0 1 386 344" opacity="0.6"/>
+      <path d="M436 136 A 184 184 0 0 1 436 376" opacity="0.28"/>
+    </g>
+    <g fill="none" stroke="#1b9df0" stroke-linecap="round" stroke-width="22">
+      <path d="M176 200 A 80 80 0 0 0 176 312"/>
+      <path d="M126 168 A 132 132 0 0 0 126 344" opacity="0.6"/>
+      <path d="M76 136 A 184 184 0 0 0 76 376" opacity="0.28"/>
+    </g>
+    <circle cx="256" cy="256" r="74" fill="#080b0f"/>
+    <circle cx="256" cy="256" r="74" fill="none" stroke="url(#iris)" stroke-width="16"/>
+    <circle cx="256" cy="256" r="34" fill="url(#iris)"/>
+    <circle cx="240" cy="240" r="11" fill="#f2fbff" opacity="0.9"/>
+  </g>
+
+  <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="556" y="292" fill="#f2fbff" font-size="72" font-weight="700" letter-spacing="-1.5">scrypted-intercom</text>
+    <text x="556" y="354" fill="#8fa3b8" font-size="34" font-weight="400">Two-way audio for cameras that lie</text>
+    <text x="556" y="398" fill="#8fa3b8" font-size="34" font-weight="400">about their capabilities</text>
+    <g font-size="27" font-weight="600">
+      <rect x="556" y="448" width="152" height="46" rx="23" fill="#1b9df0" opacity="0.16"/>
+      <text x="581" y="478" fill="#6fc6ff">Foscam</text>
+      <rect x="724" y="448" width="152" height="46" rx="23" fill="#4ae3a1" opacity="0.16"/>
+      <text x="749" y="478" fill="#6fe8b8">Reolink</text>
+      <rect x="872" y="448" width="120" height="46" rx="23" fill="#f0c33b" opacity="0.16"/>
+      <text x="917" y="478" fill="#f3d071">Tapo</text>
+    </g>
+  </g>
+</svg>

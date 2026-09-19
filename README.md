@@ -1,3 +1,5 @@
+<img src=".github/assets/icon.svg" width="96" align="right" alt="">
+
 # Scrypted two-way audio plugins for cameras that lie about their capabilities
 
 Three Scrypted mixin plugins that add working two-way audio (and, for Foscam, pan/tilt) to
