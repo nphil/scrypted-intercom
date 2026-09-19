@@ -224,9 +224,18 @@ cd tapo-intercom && node tools/clear-onvif-twoway.mjs
 ## Published copy on GitHub
 
 A sanitized snapshot of the three plugins plus this document is pushed to
-**https://github.com/nphil/scrypted-intercom** (private). The sanitising replaces the Scrypted
-host with `scrypted.local` and the camera account name with `cameraaccount`; no passwords were
-ever in these files (all credentials come from Scrypted settings or environment variables).
+**https://github.com/nphil/scrypted-intercom** (PUBLIC, ISC licensed). The sanitising replaces
+the Scrypted host with `scrypted.local` and the camera account name with `cameraaccount`; no
+passwords were ever in these files (all credentials come from Scrypted settings or environment
+variables). History was squashed to a single commit before publishing, deliberately: the first
+draft had vendored an unlicensed file and it needed to be gone from history, not just from HEAD.
+
+**Licensing, in case it comes up:** `tapo-intercom/src/mpegts.ts` is written from go2rtc's
+`pkg/mpegts/muxer.go` (MIT), NOT copied from Scrypted's Tapo plugin. Scrypted's copy sits in a
+directory with no licence grant (its root `LICENSE.md` defers licensing per directory and
+`plugins/tapo` declares none), so it cannot be redistributed. The rewrite was verified on the
+hardware: test sweeps through a Tapo C120 were confirmed audible before the vendored file was
+deleted.
 
 **The deployed source of truth is this workspace, not GitHub** — `scrypted-deploy` runs from
 `foscam-intercom/`, `reolink-intercom/` and `tapo-intercom/` here. So after changing a plugin,
