@@ -1,53 +1,72 @@
 <img src=".github/assets/icon.svg" width="96" align="right" alt="">
 
-# Scrypted two-way audio plugins for cameras that lie about their capabilities
+# Scrypted two-way audio for cameras that lie about their capabilities
 
-Three Scrypted mixin plugins that add working two-way audio (and, for Foscam, pan/tilt) to
-cameras where the standards-based path does not exist or where the first-party plugin cannot
-authenticate:
+One Scrypted plugin, `camera-intercom`, that adds working two-way audio (and vendor pan/tilt) to
+cameras where the standards-based path does not exist, or where the first-party plugin cannot
+authenticate. Drivers live behind one interface, so a new camera is a new driver file rather than
+a new plugin:
 
-| Plugin | Cameras | Why it exists |
+| Driver | Devices | Why it exists |
 | --- | --- | --- |
-| [`foscam-intercom`](foscam-intercom) | Foscam R2C | no ONVIF backchannel, no RTSP backchannel, no CGI talk command — uses Foscam's proprietary protocol on the media port, plus PTZ over CGI |
-| [`reolink-intercom`](reolink-intercom) | Reolink RLC-833A (and likely other non-doorbell Reolinks) | Reolink cameras have no ONVIF backchannel (only doorbells do) — uses the Baichuan protocol on TCP 9000 |
-| [`tapo-intercom`](tapo-intercom) | TP-Link Tapo C120, C225 | the first-party plugin trusts an auth flag the cameras get wrong, and 401s forever on some of them |
+| `onvif-backchannel` | anything implementing Profile T two-way audio (Amcrest/Dahua, Hikvision, Reolink **doorbells**, the author's own feeder firmware) | the standards-based path — tried first, and the only driver that is not a vendor workaround |
+| `foscam` | Foscam R2C | no ONVIF backchannel, no RTSP backchannel, no CGI talk command — Foscam's proprietary protocol on the media port, plus PTZ over CGI |
+| `reolink` | Reolink RLC-833A (and likely other non-doorbell Reolinks) | Reolink *cameras* have no ONVIF backchannel, only doorbells do — the Baichuan protocol on TCP 9000 |
+| `tapo` | TP-Link Tapo C120, C225 | the first-party plugin trusts an auth flag the cameras get wrong, and 401s forever on some of them |
 
-Each plugin's own README documents its protocol at byte level, including the specific details that
-cause silent failure. **The single most useful thing in this repository is arguably the
-[verification trap](#the-verification-trap--read-this-before-believing-any-test) section** — many
-of these cameras echo-cancel their own speaker, so they cannot hear themselves, and a naive
-"play a tone and listen" test reports a working camera as broken.
+The protocols are documented at byte level at the top of each file in `src/protocols/`, including
+the specific details that cause silent failure.
+
+**The two most useful things here are arguably the
+[verification trap](#the-verification-trap--read-this-before-believing-any-test) — these cameras
+echo-cancel, so they cannot hear themselves and a naive "play a tone and record it" test reports a
+working camera as broken — and
+[Making it sound good](#making-it-sound-good-which-was-a-separate-problem-entirely), which is four
+different faults that all sounded identical.**
 
 Licensed ISC; see `NOTICE.md` for third-party attribution (the MPEG-TS muxer derives from
 go2rtc, MIT).
 
-Written up 2026-09-19 after getting talkback working on five cameras that all presented the same
-symptom: a talk button in HomeKit that did nothing. Addresses and device names below are from the
-author's own install; treat them as examples.
+Addresses and device names below are from the author's own install, with addresses rewritten;
+treat them as examples.
+
+---
 
 **If a camera goes quiet, start at [Triage](#triage-when-a-camera-goes-quiet).**
 
 ## Current state
 
-| Camera | Address | Model | Talkback provided by | PTZ provided by |
+One plugin, `@nphil/camera-intercom`, serves every device. It replaced three separate per-vendor
+plugins (`foscam-intercom`, `reolink-intercom`, `tapo-intercom`, all now uninstalled) so a new
+camera means a new driver file, not a new plugin.
+
+| Camera | Address | Model | Driver | PTZ provided by |
 | --- | --- | --- | --- | --- |
-| Gym | 192.168.4.143 | Foscam R2C | `foscam-intercom` (ours) | `foscam-intercom` (ours) |
-| Office | 192.168.1.103 | Reolink RLC-833A | `reolink-intercom` (ours) | Scrypted `ONVIF PTZ` mixin |
-| Plant Room | 192.168.4.188 | Tapo C225 | `tapo-intercom` (ours) | Scrypted `ONVIF PTZ` mixin |
-| Bird | 192.168.4.201 | Tapo C120 | `tapo-intercom` (ours) | none |
-| Tool Room | 192.168.4.174 | Tapo C120 | `tapo-intercom` (ours) | none |
+| Gym | 10.0.0.11 | Foscam R2C | `foscam` | `Vendor PTZ` mixin (Foscam CGI) |
+| Office | 10.0.0.12 | Reolink RLC-833A | `reolink` | Scrypted `ONVIF PTZ` mixin |
+| Plant Room | 10.0.0.13 | Tapo C225 | `tapo` | Scrypted `ONVIF PTZ` mixin |
+| Bird | 10.0.0.14 | Tapo C120 | `tapo` | none |
+| Tool Room | 10.0.0.15 | Tapo C120 | `tapo` | none |
+| Cat Feeder | 10.0.0.16 | LibreFeed (our firmware) | `onvif-backchannel` | none |
 
-The plugins live in this workspace and are deployed to Scrypted at
-`https://scrypted.local:10443` (BeastNAS, tailnet address) with `npx scrypted-deploy`.
+All six verified by ear on 2026-09-19: clean, continuous, full level.
 
-The first-party `@scrypted/tapo` plugin has been **uninstalled** — it cannot authenticate to at
-least one of these cameras (see below), and running two Intercom implementations on one device is
-ambiguous. `@scrypted/reolink` is still installed (it provides the Office camera itself) but its
-`useOnvifTwoWayAudio` setting is deliberately **off**.
+Two Scrypted devices come from the plugin: **Camera Intercom** (the talkback mixin) and **Vendor
+PTZ** (a separate mixin provider — `canMixin` cannot see the device, so one combined provider
+would advertise dead `PanTiltZoom` on cameras that have none).
 
-## The one idea behind all five fixes
+Deployed to Scrypted at `https://scrypted.local:10443` (BeastNAS, tailnet) with
+`npx scrypted-deploy`.
 
-Every single failure was a device **advertising a capability or a protocol dialect it does not
+Not ours, deliberately left alone: **Back Door** and **Front Door** are Reolink *doorbells*,
+which genuinely do implement the ONVIF backchannel, so they keep working on `@scrypted/reolink`.
+**Backyard** is dead hardware. The first-party `@scrypted/tapo` is **uninstalled** (it cannot
+authenticate to one of these cameras); `@scrypted/reolink` stays, with `useOnvifTwoWayAudio`
+deliberately **off**.
+
+## The one idea behind all the protocol fixes
+
+Every protocol failure was a device **advertising a capability or a protocol dialect it does not
 honour**, and Scrypted believing it:
 
 * Reolink: Scrypted advertised `Intercom` because `useOnvifTwoWayAudio` was on, but the camera
@@ -60,23 +79,60 @@ honour**, and Scrypted believing it:
 
 So: **do not trust a capability flag. Ask the device, then verify by listening.**
 
+## Making it sound good, which was a separate problem entirely
+
+Getting each protocol to accept audio did not make any of it sound *right*. Four distinct faults
+produced near-identical symptoms — "beep, pause, then continuous" — and each needed its own
+evidence. The pump in `src/mixin.ts` now holds three invariants, each earned:
+
+| Fault | How it sounded | Cause | Fix |
+| --- | --- | --- | --- |
+| Per-frame ADPCM reset | pulsing tone, ticks | encoder state reset every frame (pre-existing in the old Reolink plugin) | one encoder per session |
+| Device warm-up | short beep, gap, then fine | device drops audio while its speaker path opens | open the session on `WARMUP_MS` (300 ms) of **silence** |
+| Pacing debt | gap after any startup stumble | on underrun the clock kept accruing debt, then fired frames back-to-back to catch up — and every device **discards** faster-than-real-time audio, so the burst was binned | never carry debt; reset the clock to now |
+| ffmpeg's ragged start | beep, pause, then continuous | ffmpeg's first read lands early as a lump, then pauses; the pump faithfully rendered that shape | hold a `LEAD_MS` (250 ms) buffer before real audio flows; re-earn it after a stall |
+
+Plus: the stream is **continuous** — when the source has nothing ready the frame is silence, never
+a hole — and the downsample from HomeKit's 16/24 kHz Opus uses soxr with triangular dither where
+ffmpeg has it (probed once, falls back safely).
+
+**The feeder needed the opposite of every camera.** Vendor cameras *discard* early audio, so the
+pump sends at exactly real time. Our own firmware *queued* what it was sent and wrote it straight
+into ALSA with no jitter buffer, so exact-real-time pacing left zero slack and scheduler jitter
+became underruns. That is now fixed in the firmware (`librefeed`: 120 ms preroll, silence
+concealment, 500 ms cap, and it logs `concealed`/`dropped` counts), which benefits every
+backchannel client rather than just this plugin. `format.prebufferMs` — set **only** by the
+`onvif-backchannel` driver — fills that preroll immediately instead of waiting for it.
+
+### Two instrument traps that cost real time
+
+1. **`lavfi`'s `sine` generates at about −18 dBFS.** A tone played through the plugin sounded
+   "quieter and different" than a Python sender at 0.8 full scale — 16 dB of it was the
+   *generator*. Any loudness judgement made with a raw `sine` is measuring ffmpeg, not the path.
+   Lift it (`-af volume=6.3`) before believing anything about level.
+2. **ffmpeg lets the last `-af` win.** Adding the resampler as `-af aresample=…` silently
+   discarded the caller's entire filter chain — it ate the `volume=` above and presented exactly
+   as "the device plays quietly". Resampler settings therefore go in as swresample *output
+   options* (`-resampler soxr -precision 28 -dither_method triangular`), which compose.
+
 ## Why each camera needs what it needs
 
-### Gym — Foscam R2C → `foscam-intercom`
+### Gym — Foscam R2C → `foscam` driver
 No standards-based audio-in exists: ONVIF answers `AudioOutputNotSupported`, the RTSP server is a
 LIVE555 build from 2014 with no backchannel and no `ANNOUNCE`, and the CGI API has no talk
 command. Talkback goes over Foscam's proprietary protocol on the media port (88). The critical
-detail is the speaker-on payload shape; full protocol notes in `foscam-intercom/README.md`.
-This plugin also provides pan/tilt over the Foscam CGI API.
+detail is the speaker-on payload shape; full protocol notes at the top of
+`camera-intercom/src/protocols/foscamTalk.ts`. Pan/tilt comes from the same plugin's `Vendor
+PTZ` mixin over the Foscam CGI API (`src/protocols/foscamCgi.ts`).
 
-### Office — Reolink RLC-833A → `reolink-intercom`
+### Office — Reolink RLC-833A → `reolink` driver
 Reolink cameras (as opposed to Reolink **doorbells**) have no ONVIF backchannel, and no firmware
 will add it — v3.1.0.3016 is the last firmware for hardware `IPC_523D88MP`. Talkback goes over
 Reolink's Baichuan protocol on TCP 9000. The critical detail: ADPCM blocks must be
 `lengthPerEncoder / 2 + 4` = **516** bytes; at 1024 the camera acknowledges everything and plays
-silence. Full notes in `reolink-intercom/README.md`.
+silence. Full notes in `camera-intercom/src/protocols/baichuan.ts`.
 
-### All three Tapo → `tapo-intercom`
+### All three Tapo → `tapo` driver
 Talkback goes over Tapo's own protocol on port 8800 (HTTP Digest, then a multipart stream, then
 G.711 A-law in MPEG-TS with Tapo's private stream type `0x90`). Two reasons this is a custom
 plugin rather than the first-party one:
@@ -91,7 +147,7 @@ plugin rather than the first-party one:
    one. Hence the optional `Previous Tapo Cloud Password` setting — clear it once every camera
    reports `current`.
 
-Full notes in `tapo-intercom/README.md`.
+Full notes in `camera-intercom/src/protocols/tapoClient.ts`.
 
 ## Quality, latency and reliability — measured
 
@@ -160,52 +216,73 @@ make good controls.
 
 ## Triage: when a camera goes quiet
 
-1. **Is it a protocol failure or a silent one?** Run the plugin's self-test:
+1. **Is it a protocol failure or a silent one?** Run the plugin's self-test (the plugin's
+   `Self test` setting, or `tools/verify.mjs` for every device at once):
    ```sh
-   cd tapo-intercom   # or reolink-intercom / foscam-intercom
-   SCRYPTED_URL=https://scrypted.local:10443 SCRYPTED_USER=… SCRYPTED_PASS=… node tools/selftest.mjs
+   cd camera-intercom
+   SCRYPTED_URL=https://scrypted.local:10443 SCRYPTED_USER=… SCRYPTED_PASS=… \
+     node tools/verify.mjs "Gym Camera" "Office Camera" "Plant Room Camera" \
+       "Bird Camera" "Tool Room Camera" "Plant Room Cat Feeder"
    ```
    A protocol failure names itself (401, no session, timeout). `INCONCLUSIVE` means the protocol
    is fine and you need to listen.
 
-2. **Tapo 401?** Check the dialect — takes 5 seconds and distinguishes "wrong password" from
-   "different derivation" from "different protocol entirely":
+2. **Does it sound wrong rather than fail?** Play a level-matched tone on each device in turn —
+   this is the tool that found every audio fault above:
    ```sh
-   python3 /tmp/tapo_digest2.py     # recreate from tapo-intercom/README.md if /tmp was cleared
+   SCRYPTED_URL=… SCRYPTED_USER=… SCRYPTED_PASS=… SECONDS=6 node tools/listen-all.mjs "Bird Camera"
    ```
-   The plugin already falls back between SHA256 and MD5 and between the current and previous
-   password, so a 401 here means something new: a factory reset/re-pair (dialect changed), a
-   password change not recorded in the plugin, or a firmware that moved to KLAP auth (not
-   implemented — would need adding to `tapoClient.ts`).
+   It lifts the tone 6.3× on purpose (see the instrument traps above) and spaces sessions out,
+   because several of these cameras suppress their speaker while another talk session is open.
+   The plugin console also reports `… ms sent as silence (N source stall(s))` — non-zero means
+   the *source* was struggling, not the device.
 
-3. **A talk button that does nothing, with no error?** Look for a dead capability flag:
+3. **Tapo 401?** Check the dialect — takes 5 seconds and distinguishes "wrong password" from
+   "different derivation" from "different protocol entirely". The plugin already falls back
+   between SHA256 and MD5 and between the current and previous password, so a 401 means
+   something new: a factory reset/re-pair (dialect changed), a password change not recorded in
+   the plugin, or a firmware that moved to KLAP auth (not implemented — would need adding to
+   `tapoClient.ts`).
+
+4. **A talk button that does nothing, with no error?** Look for a dead capability flag:
    `useOnvifTwoWayAudio` on Reolink, `onvifTwoWay` on the ONVIF-provided cameras. If a device
-   advertises `Intercom` from a flag rather than from one of these plugins, that is the bug.
+   advertises `Intercom` from a flag rather than from this plugin, that is the bug.
 
-4. **Changed the Tapo account password?** Put the old one in `Previous Tapo Cloud Password` and
+5. **Feeder choppy?** That is a buffering question, not an audio-path one. Ask the device: its
+   own `POST /speaker/tone` bypasses the network entirely, so if that is smooth while talkback is
+   not, the fault is in how the FIFO is being fed. Then read `/tmp/librefeed-media.log` for
+   `done (<played>, <concealed>, <dropped>)` — steady concealment means the firmware's 120 ms
+   preroll is too small or the network is struggling; drops mean a sender ahead of real time.
+
+6. **Changed the Tapo account password?** Put the old one in `Previous Tapo Cloud Password` and
    the new one in `Tapo Cloud Password`, then re-run the self-test on each camera; the
    `auth ok: used … with the … cloud password` line tells you which cameras have caught up.
 
-5. **After any change that affects HomeKit**, reload the HomeKit plugin so accessories
-   re-advertise two-way audio — every `tools/selftest.mjs` does this at the end. A camera whose
-   audio works in Scrypted but not HomeKit usually just needs this.
+7. **After any change that affects HomeKit**, reload the HomeKit plugin so accessories
+   re-advertise two-way audio. A camera whose audio works in Scrypted but not HomeKit usually
+   just needs this.
 
 ## Useful commands
 
 ```sh
-# deploy a plugin after editing it (note --include=dev: npm omit=dev is set globally here,
-# and without the flag the webpack terser plugin is pruned and the build fails)
-cd <plugin> && npm install --include=dev && NODE_ENV=production npm run build \
+cd camera-intercom
+
+# deploy after editing (note --include=dev: npm omit=dev is set globally here, and without the
+# flag the webpack terser plugin is pruned and the build fails)
+npm install --include=dev && NODE_ENV=production npm run build \
   && NODE_TLS_REJECT_UNAUTHORIZED=0 npx scrypted-deploy scrypted.local:10443
 
-# attach a plugin to a camera (and remove the upstream mixin where applicable)
-node tools/configure.mjs        # see each README for the env vars
+# attach the plugin to a camera (credentials per vendor, address per device)
+SCRYPTED_URL=… SCRYPTED_USER=… SCRYPTED_PASS=… node tools/configure.mjs "Bird Camera"
 
-# Tapo: A/B a camera against the first-party plugin, then restore (reversible)
-cd tapo-intercom && TAPO_CAMERA_NAME="Bird Camera" node tools/ab_upstream.mjs
+# what advertises Intercom right now, and which plugin provides it
+node tools/inventory.mjs
 
-# Tapo: turn off the inert ONVIF two-way flags
-cd tapo-intercom && node tools/clear-onvif-twoway.mjs
+# listening test, level-matched, one device at a time
+SECONDS=6 node tools/listen-all.mjs "Gym Camera"
+
+# feeder firmware: roll back the media binary if a change misbehaves
+ssh root@10.0.0.16 'cd /opt/librefeed && mv librefeed-media.bak librefeed-media && kill $(pidof librefeed-media)'
 ```
 
 `~/.scrypted/login.json` holds the deploy credentials; `scrypted-deploy` needs it.
@@ -214,25 +291,33 @@ cd tapo-intercom && node tools/clear-onvif-twoway.mjs
 
 * **`useOnvifTwoWayAudio` (Reolink) and `onvifTwoWay` (Tapo) stay OFF.** They advertise
   capabilities these cameras do not have. Turning them on re-creates the original bug.
+* **Back Door and Front Door stay on `@scrypted/reolink`.** They are doorbells, which *do*
+  implement the ONVIF backchannel. Working cameras do not get migrated onto our code.
 * **`@scrypted/tapo` stays uninstalled.** It cannot authenticate to the Bird camera on any
   firmware released so far.
 * **Tapo auto-upgrade stays OFF** (it already is, on all three). It is what stops a working
   camera breaking unattended at 03:00.
 * **The self-tests do not fail on a missing sweep.** That is not laziness; see the verification
-  trap above.
+  trap above. A working C120 was once diagnosed as broken this way.
 * **The Foscam is not firmware-updated.** Its talkback rides an undocumented protocol validated
   against build 2.91.2.80 specifically.
+* **`prebufferMs` is per-driver and only the feeder sets it.** Front-loading audio into a vendor
+  camera is thrown away — they discard anything faster than real time.
+* **The Kibble plugin keeps `ObjectDetector` and nothing else.** Its intercom half moved to the
+  `onvif-backchannel` driver. Do not detach the Kibble mixin from the feeder to "clean up" — it
+  still carries the detection feed (the migration script learned this the hard way).
 
 ## Published copy on GitHub
 
-A sanitized snapshot of the three plugins plus this document is pushed to
-**https://github.com/nphil/scrypted-intercom** (PUBLIC, ISC licensed). The sanitising replaces
-the Scrypted host with `scrypted.local` and the camera account name with `cameraaccount`; no
-passwords were ever in these files (all credentials come from Scrypted settings or environment
-variables). History was squashed to a single commit before publishing, deliberately: the first
-draft had vendored an unlicensed file and it needed to be gone from history, not just from HEAD.
+A sanitized snapshot of the plugin plus this document is pushed to
+**https://github.com/nphil/scrypted-intercom** (PUBLIC, ISC licensed). Sanitising replaces the
+Scrypted host with `scrypted.local`, the camera account with `cameraaccount`, and the cameras'
+LAN addresses in measurement comments with generic labels; no passwords were ever in these files
+(all credentials come from Scrypted settings or environment variables). History was squashed to a
+single commit before the first push, deliberately: an early draft had vendored an unlicensed file
+and it needed to be gone from history, not just from HEAD.
 
-**Licensing, in case it comes up:** `tapo-intercom/src/mpegts.ts` is written from go2rtc's
+**Licensing, in case it comes up:** `src/protocols/mpegts.ts` is written from go2rtc's
 `pkg/mpegts/muxer.go` (MIT), NOT copied from Scrypted's Tapo plugin. Scrypted's copy sits in a
 directory with no licence grant (its root `LICENSE.md` defers licensing per directory and
 `plugins/tapo` declares none), so it cannot be redistributed. The rewrite was verified on the
@@ -240,15 +325,12 @@ hardware: test sweeps through a Tapo C120 were confirmed audible before the vend
 deleted.
 
 **The deployed source of truth is this workspace, not GitHub** — `scrypted-deploy` runs from
-`foscam-intercom/`, `reolink-intercom/` and `tapo-intercom/` here. So after changing a plugin,
-refresh the published copy deliberately:
+`camera-intercom/` here. So after changing the plugin, refresh the published copy deliberately:
 
 ```sh
-rm -rf /tmp/pub/scrypted-intercom/{foscam,reolink,tapo}-intercom
 cd /tmp/pub/scrypted-intercom && git pull
-for p in foscam-intercom reolink-intercom tapo-intercom; do
-  mkdir -p $p && cp -r ~/$p/{src,tools,package.json,tsconfig.json,webpack.nodejs.config.js,README.md} $p/
-done
+rm -rf src tools && cp -r ~/camera-intercom/{src,tools} .
+cp ~/camera-intercom/{package.json,tsconfig.json,webpack.nodejs.config.js} .
 cp ~/CAMERA_TALKBACK.md README.md          # then re-apply the repo README header, see git history
 grep -rl "<scrypted-host-ip>\|<camera-account>" . | xargs -r sed -i \
   "s/<scrypted-host-ip>/scrypted.local/g; s/<camera-account>/cameraaccount/g"
