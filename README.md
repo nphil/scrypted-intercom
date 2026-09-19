@@ -16,6 +16,9 @@ cause silent failure. **The single most useful thing in this repository is argua
 of these cameras echo-cancel their own speaker, so they cannot hear themselves, and a naive
 "play a tone and listen" test reports a working camera as broken.
 
+Licensed ISC; see `NOTICE.md` for third-party attribution (the MPEG-TS muxer derives from
+go2rtc, MIT).
+
 Written up 2026-09-19 after getting talkback working on five cameras that all presented the same
 symptom: a talk button in HomeKit that did nothing. Addresses and device names below are from the
 author's own install; treat them as examples.
