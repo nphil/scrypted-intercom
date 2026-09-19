@@ -1,0 +1,47 @@
+// Presses the plugin's "Test Talkback" button over the Scrypted API, prints the result, and
+// reloads the HomeKit plugin so an already-published accessory re-advertises with two-way audio.
+//
+// Read the result with the AEC caveat in mind (see README): on a camera reporting `aec: 1` a
+// failed acoustic check is inconclusive, not proof of silence. The `auth: used ... advertised`
+// line is the unambiguous part -- it shows whether the camera lied about its password derivation.
+//
+//   SCRYPTED_URL=https://<host>:10443 SCRYPTED_USER=… SCRYPTED_PASS=… node tools/selftest.mjs
+
+import { connectScryptedClient } from '@scrypted/client';
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+const PLUGIN_NAME = 'Tapo Intercom';
+
+const sdk = await connectScryptedClient({
+    baseUrl: process.env.SCRYPTED_URL || 'https://127.0.0.1:10443',
+    pluginId: '@scrypted/core',
+    username: process.env.SCRYPTED_USER,
+    password: process.env.SCRYPTED_PASS,
+});
+const sm = sdk.systemManager;
+
+let plugin;
+for (const id of Object.keys(sm.getSystemState())) {
+    const device = sm.getDeviceById(id);
+    if (device?.name === PLUGIN_NAME)
+        plugin = device;
+}
+if (!plugin)
+    throw new Error(`${PLUGIN_NAME} is not installed`);
+
+await plugin.putSetting('testTalkback', '1');
+await new Promise(resolve => setTimeout(resolve, 24000));
+const settings = await plugin.getSettings();
+console.log(`--- lastTalkbackTest ---\n${settings.find(s => s.key === 'lastTalkbackTest')?.value || '(empty)'}`);
+
+if (process.env.RELOAD_HOMEKIT !== 'false') {
+    try {
+        const plugins = await sm.getComponent('plugins');
+        await plugins.reload('@scrypted/homekit');
+        console.log('--- homekit plugin reloaded');
+    } catch (e) {
+        console.log('homekit reload failed:', e.message);
+    }
+}
+process.exit(0);
