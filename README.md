@@ -268,24 +268,66 @@ integration's library) implements no talkback at all, its `udp_protocol.py` is P
 rather than audio, and the doorbell's CGI exposes only `volume`/`visitorLoudspeaker` for talk
 while `GetTalkAbility` answers "not support". There is no documented or undocumented buffer knob.
 
-### Scrypted app talkback does not work on NVR-recorded cameras
+### Scrypted app talkback: TWO independent causes, both isolated by A/B
 
-Established by elimination on 2026-09-19, and NOT caused by this plugin:
+Symptom was "talkback does nothing in the Scrypted app", on some cameras and not others. Two
+separate causes, each confirmed by toggling it alone:
 
-| Camera | Scrypted NVR mixin | App talkback | HomeKit |
-| --- | --- | --- | --- |
-| Bird, Office | no | works | works |
-| Front Door, Back Door, Cat Feeder | **yes** | nothing happens | works |
+**1. A regression in `@scrypted/webrtc` 0.2.89 (REQUIRED patch).** `setPlaybackInternal` selects
+the transceiver carrying the caller's microphone by `offerDirection`, which werift only populates
+when the CLIENT generated the SDP offer. Scrypted's own apps let the server offer, so it is
+undefined while the transceiver's own `direction` is `sendrecv`:
 
-With NVR attached the app plays the camera through the NVR pipeline (`starting fork
-@scrypted/nvr`, no WebRTC session in the log at all), and talkback lives inside the WebRTC
-session control -- so there is no talk path to call. Proven by removing the NVR mixin from the
-feeder: app talkback started working immediately, and came back on restoring it.
+```
+setPlayback called, options={"audio":true,...} hasIntercom=true
+transceiver found=false offerDirection=undefined direction=sendrecv
+all=[{"kind":"video","dir":"sendonly"},{"kind":"audio","dir":"sendrecv"}]
+BAILED: no audio transceiver matched
+```
 
-This is client-side, so it cannot be patched on the server the way the `offerDirection` bug was.
-NVR 0.12.105 dates from August, so unlike that regression it is long-standing behaviour. The
-practical position: **HomeKit is the intercom path for NVR-recorded cameras** and works on every
-one of them; the app works on cameras without NVR.
+Every failure path there is a bare `return`, hence total silence. Verified by reverting the patch
+twice -- with the webcodec player on AND off -- and watching the same camera fail both times, then
+work again once restored. `tools/patch-webrtc-talkback.py` applies it (idempotent);
+`tools/debug-webrtc-talkback.py` re-adds the logging above when needed.
+
+0.2.89 was published 2026-09-17, two days before this was diagnosed, after ten months without a
+release, and the public `main` branch is still 0.2.88 -- which is why the source of the broken
+build could not be read at first, and why nobody had reported it.
+
+**2. The app's "WebCodec Player" setting (user choice, not a bug).** With it enabled, cameras that
+have recordings play through `getRecordingStream` with `container: "webcodec"` -- a `VideoDecoder`
+pipeline with NO peer connection. The microphone only exists on the WebRTC session (`i_(...)`'s
+sixth argument, passed by the live path as
+`t.interfaces?.includes(ScryptedInterface.Intercom) ? t.id : void 0`, and NOT passed at all by the
+recording path), so the mic button has nothing to call. Cameras without recordings stay on the
+WebRTC path, which is exactly why Bird and Office worked while the doorbells and the feeder did
+not.
+
+Confirmed on the Front Door: webcodec on -> no talkback; webcodec off -> talkback works.
+
+What the toggle actually buys, from the client bundle: hardware decode via WebCodecs probing
+`avc1.640034` and `hev1.1.6.L153.B0`, so **H.265 streams play without server-side transcoding**,
+plus frame-accurate `scrub`/`changeTime`/`setPlaybackRate` for timeline review. The trade is
+two-way audio. Their own UI calls it experimental, and the code disables it on desktop Linux.
+
+**Net: keep the patch, and turn WebCodec Player off when app talkback matters.** HomeKit is
+unaffected by both -- it resolves the device by id and calls `startIntercom` directly, never
+touching WebRTC, which is why it worked on all eight devices throughout.
+
+Worth reporting upstream, with precise pointers: the `offerDirection` selection in
+`session-control.ts`, and the recording path omitting the intercom argument that the live path
+passes.
+
+### Diagnostic lesson from this one
+
+Three wrong conclusions were reached before the right one -- mixin ordering, then NVR-recorded
+cameras, then a stale app session -- because the failure was entirely silent and the evidence was
+absence. What actually settled it, in order: instrumenting the bare `return`s so "the app never
+asked" became a fact rather than a guess; testing a camera this plugin does not touch (the Ring
+doorbell) to prove the fault was not ours; reverting the patch to prove it was load-bearing; and
+finally reading the NVR client's shipped JS, which is closed-source as a repo but perfectly
+readable as a bundle. When a code path has no logging, add the logging before forming theories
+about the parts that do.
 
 ### Office camera zoom: another dead capability
 
