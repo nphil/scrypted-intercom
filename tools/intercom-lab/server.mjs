@@ -318,7 +318,7 @@ async function measureAcousticLoop(trials, burstMs, warmupMs) {
  *  are injected at known instants and every onset is paired with the most recent injection before
  *  it, so nothing is attributed to the wrong burst and a dropped burst is visible as a burst with
  *  no onset rather than as a missing sample. */
-async function measureContinuous(bursts, spacingMs, burstMs) {
+async function measureContinuous(bursts, spacingMs, burstMs, warmMs = 2000) {
     await session.acquire();
     try {
         const onsets = [];
@@ -363,9 +363,12 @@ async function measureContinuous(bursts, spacingMs, burstMs) {
         };
         const pumping = pump();
 
-        // Two seconds of continuous silence first: this is the warm-up, and unlike the windowed
-        // version the stream never stops afterwards.
-        await new Promise(r => setTimeout(r, 2000));
+        // Warm-up silence. CAUTION: on a device that QUEUES the backchannel (as these doorbells
+        // do) every silence frame written here is audio the device must still play out before it
+        // reaches the tone, so this directly inflates the measured delay. That is why it is a
+        // parameter: `warm=0` is the control that separates the device's own latency from a
+        // backlog this bench created itself.
+        await new Promise(r => setTimeout(r, warmMs));
         armed = true;
         await new Promise(r => setTimeout(r, 300));
 
@@ -395,6 +398,7 @@ async function measureContinuous(bursts, spacingMs, burstMs) {
             mode: 'continuous stream, detector armed throughout',
             spacingMs,
             burstMs,
+            warmMs,
             bursts: paired,
             heard: hits.length,
             of: bursts,
@@ -408,6 +412,41 @@ async function measureContinuous(bursts, spacingMs, burstMs) {
     } finally {
         session.release();
     }
+}
+
+
+/** Listen-only: spawns its own downlink and reports tone onsets with timestamps relative to the
+ *  request, opening NO backchannel. That separation is the point -- it lets audio be injected by
+ *  something else entirely (the Scrypted plugin, over whichever protocol it is configured for)
+ *  while this side only observes, so two uplink protocols can be compared on one camera without
+ *  this bench being a second writer. */
+async function listenForOnsets(seconds) {
+    const url = `rtsp://${encodeURIComponent(USER)}:${encodeURIComponent(PASS)}@${CAMERA}:554/${MOUNT}`;
+    const ff = spawn('ffmpeg', [
+        '-hide_banner', '-loglevel', 'error', '-nostdin', '-rtsp_transport', 'tcp',
+        '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32', '-analyzeduration', '0',
+        '-i', url, '-vn', '-ac', '1', '-ar', String(DOWNLINK_RATE), '-f', 's16le', '-',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const started = nowMs();
+    const onsets = [];
+    let above = false;
+    ff.stdout.on('data', chunk => {
+        const at = nowMs();
+        const chunkMs = (chunk.length / 2) / DOWNLINK_RATE * 1000;
+        for (let off = 0, blk = 0; off + block * 2 <= chunk.length; off += block * 2, blk++) {
+            const f = new Float32Array(block);
+            for (let sm = 0; sm < block; sm++)
+                f[sm] = chunk.readInt16LE(off + sm * 2) / 32768;
+            const mag = goertzel(f, DOWNLINK_RATE, TONE_HZ);
+            const hot = mag > 0.05;
+            if (hot && !above)
+                onsets.push({ atMs: Math.round((at - chunkMs + (blk * block / DOWNLINK_RATE) * 1000 - started) * 10) / 10, mag: Math.round(mag * 100) / 100 });
+            above = hot;
+        }
+    });
+    await new Promise(r => setTimeout(r, seconds * 1000));
+    ff.kill('SIGKILL');
+    return { listenedSeconds: seconds, ffmpegStartupMs: 0, onsets };
 }
 
 const staticFiles = {
@@ -442,6 +481,13 @@ const server = http.createServer(async (req, res) => {
         }));
         return;
     }
+    if (url.pathname === '/listen') {
+        const seconds = Math.min(60, Math.max(1, parseInt(url.searchParams.get('seconds') || '12', 10)));
+        const result = await listenForOnsets(seconds);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+    }
     if (url.pathname === '/loop') {
         if (browserStreamers > 0) {
             res.writeHead(409, { 'content-type': 'application/json' });
@@ -454,8 +500,9 @@ const server = http.createServer(async (req, res) => {
         const bursts = Math.min(20, Math.max(1, parseInt(url.searchParams.get('n') || '6', 10)));
         const spacing = Math.min(10000, Math.max(500, parseInt(url.searchParams.get('spacing') || '2000', 10)));
         const burst = Math.min(1000, Math.max(20, parseInt(url.searchParams.get('burst') || '200', 10)));
+        const warm = Math.min(5000, Math.max(0, parseInt(url.searchParams.get('warm') ?? '2000', 10)));
         try {
-            const result = await measureContinuous(bursts, spacing, burst);
+            const result = await measureContinuous(bursts, spacing, burst, warm);
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify(result, null, 2));
         } catch (e) {

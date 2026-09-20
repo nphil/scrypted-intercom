@@ -244,15 +244,20 @@ pacing underneath, and the two can be compared by ear.
 
 The doorbells accept BOTH talk protocols, and they are not equal:
 
-| Path | Frames | This plugin's latency | Codec |
-| --- | --- | --- | --- |
-| Baichuan ADPCM 16 kHz | 64 ms | ~205 ms | 4 bits/sample |
-| **ONVIF backchannel PCMU 8 kHz** | **20 ms** | **88-98 ms** | 8 bits/sample |
+| Path | Frames | This plugin's latency | Device-side delay | Codec |
+| --- | --- | --- | --- | --- |
+| **Baichuan ADPCM 16 kHz** | 64 ms | ~174-205 ms | **~2.22 s** | 4 bits/sample |
+| ONVIF backchannel PCMU 8 kHz | **20 ms** | **88-98 ms** | ~2.9 s | 8 bits/sample |
 
-The backchannel wins on both counts that this plugin controls -- a third of the frame size and
-half the pipeline latency -- and G.711 is 8 bits per sample against ADPCM's 4, so the narrower
-band is not necessarily the worse sound. Front Door runs it (`backchannelOverrides`
-`<host>=554/Preview_01_sub` plus a `driverOverrides` entry) and was confirmed clean by ear.
+The backchannel wins every count this plugin controls -- a third of the frame size, half the
+pipeline latency, and 8 bits per sample against ADPCM's 4 -- and it still LOSES overall, because
+the camera plays Baichuan about 650 ms sooner (measured with `tools/protocol-delay-ab.mjs`; see
+"The doorbells are back on Baichuan ADPCM" below). Both doorbells therefore run the vendor path,
+by falling through `driverOverrides` to detection.
+
+The backchannel work is not wasted: it is the only path the feeder uses, it is the standards-based
+driver, and the digest fix below was needed to discover any of this. But on these doorbells it is
+the wrong choice, and the table above is the reason -- the last column is the one the owner hears.
 
 Reaching it needed a real fix: **the RTSP client never authenticated**. It was written against a
 device with auth disabled, so `DESCRIBE` returned 401 and the driver reported "offers no sendonly
@@ -450,17 +455,35 @@ Measured from an iPhone over that page:
 | | |
 |---|---|
 | Our uplink, capture -> socket | **2.4 ms** average, 38 ms peak, over 3537 frames |
-| Acoustic round trip (speaker -> air -> mic -> AAC -> ffmpeg) | **163-280 ms**, median ~205 |
-| Of which the AAC return leg's own framing | 64-128 ms (one AAC frame at 16 kHz; p90 chunk gap 119 ms) |
+| Device-side delay, our audio to the doorbell's speaker | **~2.0-2.3 s** (see the correction below) |
+| Downlink used to observe it (camera AAC -> ffmpeg) | runs ~100 ms ahead of real time; first byte 407 ms |
 
-So the software costs ~2 ms and the device owns the rest. There is nothing left to win on our side
-of this camera, which is the useful conclusion: **stop optimising the pipeline.**
+So the software costs ~2 ms and the device owns *everything* else. The useful conclusion is
+unchanged and now much stronger: **stop optimising our pipeline; the remaining latency is not
+ours.**
 
-**The finding worth acting on: these cameras drop audio while their speaker path restarts.** With
-the stream stopping between bursts only 4 of 8 were audible at all (and the survivors timed
-incoherently); on one unbroken 20 ms cadence 7 of 8 were audible (only the very first lost) at a
-steady 163-280 ms. That is the "audio cuts out" complaint: every utterance after a pause pays the
-re-initialisation, and pays it with its first word.
+### CORRECTION: an earlier "163-280 ms" here was an aliasing artifact
+
+A first pass reported 163-280 ms and it was wrong. Tones were injected every 2 s while the true
+delay was ~2.2 s, so each tone arrived inside the NEXT burst's detection window and was scored
+against the wrong injection -- producing a plausible, self-consistent, entirely fictional number
+that was committed and published before the author's ear caught it ("still noticing a 1-2s lag"). His
+report was right and the instrument was wrong.
+
+What the correction took, in order: varying the spacing to 8 s, which immediately showed
+~2.0-2.3 s; ruling out the bench's own warm-up (identical at `warm=0`, `500` and `2000`, so the
+silence we send is NOT queued ahead of the audio); and ruling out the downlink (ffmpeg delivers
+8.70 s of audio in 8.60 s wall, i.e. ~100 ms ahead of real time, not seconds behind).
+
+**Lesson worth keeping: a periodic stimulus cannot measure a delay longer than its own period.**
+Vary the spacing, or an aliased result will look like a clean one. The three earlier bench bugs
+below were each caught by an impossible number; this one was caught by a human ear, because the
+wrong answer was entirely plausible.
+
+**The other finding stands: these cameras drop audio while their speaker path restarts.** With the
+stream stopping between bursts only 4 of 8 were audible at all; on one unbroken 20 ms cadence 7 of
+8 were audible, only the very first lost. That is the "audio cuts out" complaint: every utterance
+after a pause pays the re-initialisation, and pays it with its first word.
 
 Acted on in `onvifBackchannel.ts`: `close()` now **parks** the session and keeps writing silence on
 the same 20 ms cadence for `backchannelKeepAliveMs` (default 20 s, `0` restores the old immediate
@@ -488,6 +511,37 @@ near-full-scale trips these cameras' ALC and mimics the degradation being measur
 really is acoustic, proven by setting the camera's speaker to volume 0 via `SetAudioCfg` (tone
 vanished: 0/4 with peaks of 0.00) and restoring it. Without that A/B, a digital loopback inside the
 camera would look identical.
+
+### The doorbells are back on Baichuan ADPCM, and why that reverses an earlier decision
+
+`tools/protocol-delay-ab.mjs` asks the question the original choice never did: not how fast WE
+are, but how soon the camera actually plays. The plugin sends a real 1 kHz tone through one driver
+at a time while the bench only LISTENS (`/listen`, no backchannel of its own, so there is exactly
+one writer), and the onset is timed in the camera's own mic stream. Front Door, three trials each:
+
+| Uplink protocol | Device-side delay |
+|---|---|
+| ONVIF PCMU backchannel | 2897 / 3014 / 2807 ms |
+| Baichuan ADPCM (`reolink`) | **2224 / 2238 ms** |
+
+The absolute values carry a fixed offset (plugin startup, the tone's own ffmpeg, the listener's
+~100 ms downlink), but both arms share it, so the ~650 ms gap is real. Baichuan plays sooner.
+
+**So the doorbells were moved back**: `driverOverrides` now contains only
+`<feeder>=onvif-backchannel`, and the two doorbells fall through to detection, which prefers the
+vendor protocol. Cost: our own pipeline goes from 92 ms back to ~174 ms (64 ms frames instead of
+20 ms). Benefit: ~650 ms off the device. Net ~570 ms better, and latency is what the complaint was
+about.
+
+**The mistake worth not repeating:** the original switch to the backchannel was justified with a
+careful measurement of the wrong half of the system. 20 ms frames and 92 ms of pipeline latency
+were real, reproducible improvements to the part we control, and the part we control turned out to
+be ~4% of the total. A local optimum, measured honestly, can still make the system worse — always
+measure the number the user can actually perceive, end to end, before choosing.
+
+The keep-alive above is therefore now only exercised by the feeder. It is kept because the
+behaviour it fixes is real and measured, and because the doorbells would use it again if they ever
+move back (e.g. after a firmware update changes these numbers).
 
 ## Credentials, and how they drift
 
