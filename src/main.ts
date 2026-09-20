@@ -25,7 +25,7 @@ import { ScryptedDeviceBase, ScryptedDeviceType as DeviceType, ScryptedInterface
 import { detectDriver } from './detect';
 import { DriverConfig, DriverName, IntercomDriver, isPtzCapable } from './drivers/driver';
 import { FoscamDriver } from './drivers/foscam';
-import { OnvifBackchannelDriver } from './drivers/onvifBackchannel';
+import { DEFAULT_KEEP_ALIVE_MS, OnvifBackchannelDriver } from './drivers/onvifBackchannel';
 import { ReolinkDriver } from './drivers/reolink';
 import { TapoDriver } from './drivers/tapo';
 import { CameraIntercomMixin, DEFAULT_LEAD_MS, DEFAULT_WARMUP_MS } from './mixin';
@@ -44,6 +44,7 @@ const DEFAULTS: Record<string, string> = {
     backchannelPassword: '',
     backchannelRtspPort: '8554',
     backchannelRtspPath: 'sub',
+    backchannelKeepAliveMs: String(DEFAULT_KEEP_ALIVE_MS),
     driverOverrides: '',
     leadOverrides: '',
     backchannelOverrides: '',
@@ -131,6 +132,20 @@ const SETTING_DEFS: Setting[] = [
             + 'PCMU/8000 on its ONVIF backchannel but 16 kHz ADPCM over Baichuan. Set '
             + '`<host>=onvif-backchannel` to force the standards-based path.',
         type: 'textarea',
+        group: 'Advanced',
+    },
+    {
+        key: 'backchannelKeepAliveMs',
+        title: 'Backchannel Keep-Alive (ms)',
+        description: 'How long an ONVIF-backchannel session is held open after a talk session '
+            + `ends, streaming silence on the same 20 ms cadence (default `
+            + `${DEFAULT_KEEP_ALIVE_MS}; 0 tears down immediately, as before). Measured on the `
+            + 'doorbells with `tools/intercom-lab`: letting the stream stop between utterances '
+            + 'made only 4 of 8 bursts audible at all, while one unbroken cadence made 7 of 8 '
+            + 'audible at a steady 163-280 ms. These cameras discard audio while their speaker '
+            + 'path restarts, so the first word of every utterance after a pause is the cost of '
+            + 'letting them idle. A held session also skips DESCRIBE/SETUP/PLAY next time.',
+        type: 'number',
         group: 'Advanced',
     },
     {
@@ -321,6 +336,7 @@ class CameraIntercomPlugin extends ScryptedDeviceBase implements DeviceProvider,
                     password: this.get('backchannelPassword'),
                     rtspPort: mount?.port ?? Number(this.get('backchannelRtspPort')),
                     rtspPath: mount?.path ?? this.get('backchannelRtspPath'),
+                    keepAliveMs: this.keepAliveMs(),
                 });
             }
         }
@@ -356,6 +372,16 @@ class CameraIntercomPlugin extends ScryptedDeviceBase implements DeviceProvider,
     }
 
     /** Per-host lead buffer, for devices worth a tighter one than the global default. */
+    /** An explicit 0 disables the linger; anything unparseable falls back to the default rather
+     * than silently turning it off. */
+    private keepAliveMs(): number {
+        const raw = this.get('backchannelKeepAliveMs').trim();
+        if (raw === '0')
+            return 0;
+        const ms = Number(raw);
+        return Number.isFinite(ms) && ms > 0 ? ms : DEFAULT_KEEP_ALIVE_MS;
+    }
+
     private leadFor(host: string): number | undefined {
         for (const line of this.get('leadOverrides').split('\n')) {
             const [left, right] = line.split('=').map(part => part?.trim());

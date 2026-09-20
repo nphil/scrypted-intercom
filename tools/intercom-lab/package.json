@@ -1,0 +1,14 @@
+{
+  "name": "intercom-lab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Single-purpose talkback bench for one Reolink doorbell: browser mic -> RTSP ONVIF backchannel, with nothing in between.",
+  "type": "module",
+  "scripts": {
+    "build": "npx --prefix ../.. tsc ../../src/protocols/rtspBackchannel.ts ../../src/protocols/g711.ts --outDir build --module commonjs --target es2022 --lib es2024 --moduleResolution node --skipLibCheck && node -e \"require('fs').writeFileSync('build/package.json','{\\\"type\\\":\\\"commonjs\\\"}')\"",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

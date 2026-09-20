@@ -40,6 +40,15 @@ export interface DriverConfig {
     /** ONVIF backchannel only: RTSP port and mount path. */
     rtspPort?: number;
     rtspPath?: string;
+    /** ONVIF backchannel only: how long to hold a finished session open, streaming silence, so
+     * the next utterance does not pay the device's speaker-path start-up again.
+     *
+     * Measured on a Reolink doorbell with `tools/intercom-lab`: with the stream stopping between
+     * bursts only 4 of 8 were audible at all, and the survivors' timing was incoherent; on one
+     * continuous 20 ms cadence 7 of 8 were audible (only the very first lost) at a steady
+     * 163-280 ms. The camera discards audio while re-initialising its speaker, so the fix is to
+     * never let it idle between utterances of the same conversation. 0 disables the linger. */
+    keepAliveMs?: number;
     console: Console;
 }
 

@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Doorbell Intercom Bench</title>
+<style>
+  :root { color-scheme: dark; --ok:#3ddc84; --bad:#ff5f56; --dim:#8a8f98; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; padding:max(16px, env(safe-area-inset-top)) 16px 24px; background:#0d0f12; color:#e8eaed;
+         font:15px/1.45 -apple-system, system-ui, sans-serif; }
+  h1 { font-size:17px; margin:0 0 2px; letter-spacing:.2px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:18px; }
+  #enable { width:100%; padding:15px; margin-bottom:10px; border:none; border-radius:14px;
+             background:#2d6cdf; color:#fff; font-size:16px; font-weight:600; }
+  #enable.done { background:#151a20; color:var(--dim); }
+  #talk { width:100%; height:180px; border:none; border-radius:20px; font-size:21px; font-weight:600;
+          background:#1b2027; color:#e8eaed; transition:background .08s, transform .08s;
+          touch-action:none; user-select:none; -webkit-user-select:none; }
+  #talk.live { background:var(--ok); color:#07140c; transform:scale(.99); }
+  #talk:disabled { opacity:.4; }
+  .row { display:flex; gap:10px; margin-top:12px; }
+  .row button { flex:1; padding:13px; border:1px solid #2a3139; border-radius:12px; background:#151a20; color:#e8eaed; font-size:14px; }
+  /* table-layout:fixed plus explicit column widths: without these the browser re-measures every
+     column each time a value changes length (the stats tick once a second), so every row visibly
+     shifts sideways and the whole page appears to jitter. */
+  table { width:100%; margin-top:20px; border-collapse:collapse; table-layout:fixed;
+          font-variant-numeric:tabular-nums; }
+  td { padding:0; height:32px; border-bottom:1px solid #1b2027; font-size:13px;
+       white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  td:last-child { width:44%; text-align:right; color:#fff; font-weight:600; }
+  td:first-child { width:56%; color:var(--dim); font-weight:400; }
+  /* Fixed height, not max-height: a growing log otherwise reflows everything below it. */
+  #log { margin-top:16px; font:11px/1.5 ui-monospace, Menlo, monospace; color:var(--dim);
+         white-space:pre-wrap; height:190px; overflow:auto; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:11px; background:#1b2027; color:var(--dim); }
+  .pill.ok { background:rgba(61,220,132,.16); color:var(--ok); }
+  .pill.bad { background:rgba(255,95,86,.16); color:var(--bad); }
+</style>
+</head>
+<body>
+<h1>Front Door intercom bench</h1>
+<div class="sub">
+  Direct path: browser mic → μ-law → RTP → RTSP backchannel. No transcode, no lead, no queue.
+  <span id="state" class="pill">connecting</span>
+</div>
+
+<button id="enable">Enable microphone</button>
+<button id="talk" disabled>Hold to talk</button>
+
+<div class="row">
+  <button id="latch">Latch mic on</button>
+  <button id="measure">Measure loop</button>
+</div>
+<div class="row">
+  <button id="monitor">Monitor: off</button>
+  <button id="aec">Mic AEC: on</button>
+</div>
+
+<table>
+  <tr><td>Secure context / mic API</td><td id="m-env">—</td></tr>
+  <tr><td>Mic capture rate</td><td id="m-rate">—</td></tr>
+  <tr><td>Frames sent (20 ms each)</td><td id="m-frames">—</td></tr>
+  <tr><td>Our uplink: capture → socket</td><td id="m-uplink">—</td></tr>
+  <tr><td>Uplink peak</td><td id="m-uppeak">—</td></tr>
+  <tr><td>Frame gap peak</td><td id="m-gap">—</td></tr>
+  <tr><td>WebSocket round trip</td><td id="m-rtt">—</td></tr>
+  <tr><td>Downlink (camera mic)</td><td id="m-down">—</td></tr>
+  <tr><td>Acoustic round trip</td><td id="m-loop">—</td></tr>
+</table>
+
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = (...a) => { $('log').textContent = a.join(' ') + '\n' + $('log').textContent.slice(0, 4000); };
+const setState = (text, cls) => { $('state').textContent = text; $('state').className = 'pill ' + (cls || ''); };
+
+const DOWNLINK_RATE = 16000;
+const FRAME_SAMPLES = 160;          // 20 ms at 8 kHz
+
+let ws, ctx, micStream, micNode, playNode, clockOffset, rtt = null;
+let talking = false, latched = false, monitoring = false, aec = true;
+let framesSent = 0;
+let loopDetect = null;
+
+// ---- mu-law encode, same reference algorithm as the server's g711.ts -----------------------
+function linearToUlaw(sample) {
+  const BIAS = 0x84, CLIP = 32635;
+  const sign = sample < 0 ? 0x80 : 0x00;
+  let magnitude = Math.min(CLIP, Math.abs(sample)) + BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; exponent > 0 && !(magnitude & mask); mask >>= 1) exponent--;
+  const mantissa = (magnitude >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+
+// ---- worklets ------------------------------------------------------------------------------
+// Capture: Safari pins the context to the hardware rate and ignores a requested one, so the
+// 8 kHz conversion happens HERE -- biquad low-pass at 3.4 kHz (anti-alias) then fractional
+// resample -- rather than by asking for a rate that will not be honoured.
+const captureWorklet = `
+class Capture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.acc = 0;
+    this.prev = 0;
+    this.buf = new Float32Array(${FRAME_SAMPLES});
+    this.n = 0;
+    // 2nd-order Butterworth low-pass, 3400 Hz, designed for the real context rate.
+    const w0 = 2 * Math.PI * 3400 / sampleRate, c = Math.cos(w0), s = Math.sin(w0), q = 0.7071;
+    const alpha = s / (2 * q), a0 = 1 + alpha;
+    this.b0 = ((1 - c) / 2) / a0; this.b1 = (1 - c) / a0; this.b2 = this.b0;
+    this.a1 = (-2 * c) / a0; this.a2 = (1 - alpha) / a0;
+    this.x1 = this.x2 = this.y1 = this.y2 = 0;
+    this.step = 8000 / sampleRate;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const x = ch[i];
+      const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+      this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y;
+      this.acc += this.step;
+      while (this.acc >= 1) {
+        this.acc -= 1;
+        this.buf[this.n++] = y;
+        if (this.n === ${FRAME_SAMPLES}) {
+          this.port.postMessage(this.buf.slice(0), []);
+          this.n = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);
+`;
+
+// Playback: a ring buffer kept deliberately shallow (40 ms target). Deeper hides jitter but is
+// exactly the latency this bench exists to expose, so underruns are counted instead of padded.
+const playbackWorklet = `
+class Playback extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ring = new Float32Array(16384);
+    this.r = 0; this.w = 0;
+    this.acc = 0;
+    this.step = ${DOWNLINK_RATE} / sampleRate;
+    this.underruns = 0;
+    this.last = 0;
+    this.gain = 1;
+    this.port.onmessage = e => {
+      if (e.data.gain !== undefined) { this.gain = e.data.gain; return; }
+      const pcm = e.data;
+      for (let i = 0; i < pcm.length; i++) {
+        this.ring[this.w] = pcm[i];
+        this.w = (this.w + 1) % this.ring.length;
+      }
+    };
+  }
+  available() { return (this.w - this.r + this.ring.length) % this.ring.length; }
+  process(_, outputs) {
+    const out = outputs[0][0];
+    if (!out) return true;
+    for (let i = 0; i < out.length; i++) {
+      if (this.available() < 2) { out[i] = 0; this.underruns++; continue; }
+      const a = this.ring[this.r];
+      const b = this.ring[(this.r + 1) % this.ring.length];
+      out[i] = (a + (b - a) * this.acc) * this.gain;
+      this.acc += this.step;
+      while (this.acc >= 1) { this.acc -= 1; this.r = (this.r + 1) % this.ring.length; }
+    }
+    if (++this.last % 50 === 0)
+      this.port.postMessage({ underruns: this.underruns, bufferedMs: Math.round(this.available() / ${DOWNLINK_RATE} * 1000) });
+    return true;
+  }
+}
+registerProcessor('playback', Playback);
+`;
+
+const workletUrl = src => URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+
+// ---- websocket -----------------------------------------------------------------------------
+function connect() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setState('connected', 'ok'); syncClock(); };
+  ws.onclose = () => { setState('disconnected', 'bad'); $('talk').disabled = true; setTimeout(connect, 1500); };
+  ws.onerror = () => setState('error', 'bad');
+  ws.onmessage = ev => {
+    if (typeof ev.data !== 'string') {
+      const bytes = new Uint8Array(ev.data);
+      if (bytes[0] !== 0x02) return;
+      const pcm = new Int16Array(ev.data.slice(1));
+      const f = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 32768;
+      if (loopDetect) loopDetect(f);
+      if (playNode && monitoring) playNode.port.postMessage(f, [f.buffer]);
+      return;
+    }
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'ready') {
+      log(`camera ${msg.camera}/${msg.mount} backchannel ${msg.codec}/${msg.clock}`);
+      setState('backchannel live', 'ok');
+    } else if (msg.type === 'pong') {
+      rtt = performance.now() - msg.clientSent;
+      clockOffset = performance.now() - (msg.serverNow + rtt / 2);
+      ws.send(JSON.stringify({ type: 'clock', offset: clockOffset }));
+      $('m-rtt').textContent = rtt.toFixed(1) + ' ms';
+    } else if (msg.type === 'stats') {
+      $('m-frames').textContent = msg.framesSent;
+      $('m-uplink').textContent = msg.uplinkAvgMs === null ? '—' : msg.uplinkAvgMs + ' ms';
+      $('m-uppeak').textContent = msg.uplinkPeakMs + ' ms';
+      $('m-gap').textContent = msg.frameGapPeakMs + ' ms';
+    } else if (msg.type === 'error') {
+      log('server error: ' + msg.message);
+      setState(msg.message, 'bad');
+    }
+  };
+}
+
+function syncClock() {
+  ws.send(JSON.stringify({ type: 'ping', clientNow: performance.now() }));
+  setTimeout(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: 'stats' })), 400);
+}
+setInterval(() => ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'stats' })), 1000);
+setInterval(() => ws && ws.readyState === 1 && syncClock(), 5000);
+
+// ---- audio ---------------------------------------------------------------------------------
+async function startAudio() {
+  if (ctx) return;
+  // ORDER MATTERS ON iOS: getUserMedia must be the first await in the gesture's call stack.
+  // Awaiting anything else first (ctx.resume(), addModule) loses the user-activation context and
+  // Safari then denies the microphone WITHOUT EVER SHOWING A PROMPT -- which looks exactly like
+  // the page being broken.
+  if (!navigator.mediaDevices?.getUserMedia)
+    throw new Error(window.isSecureContext ? 'mediaDevices missing' : 'not a secure context (needs https)');
+
+  // iOS 17+: without this, an open mic drops playback to the receiver at low volume, which
+  // sounds like a dead return leg and would get blamed on the camera. Set before the mic opens.
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = 'play-and-record';
+  } catch (e) { log('audioSession unavailable: ' + e.message); }
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: aec, noiseSuppression: aec, autoGainControl: aec,
+      channelCount: 1,
+    },
+    video: false,
+  });
+  log('mic granted: ' + (micStream.getAudioTracks()[0]?.label || 'unnamed'));
+
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  await ctx.resume();
+  $('m-rate').textContent = ctx.sampleRate + ' Hz';
+
+  await ctx.audioWorklet.addModule(workletUrl(captureWorklet));
+  await ctx.audioWorklet.addModule(workletUrl(playbackWorklet));
+
+  const source = ctx.createMediaStreamSource(micStream);
+  micNode = new AudioWorkletNode(ctx, 'capture');
+  micNode.port.onmessage = e => sendFrame(e.data);
+  source.connect(micNode);
+  // Keep the graph pulling without routing the mic into the speaker.
+  const sink = ctx.createGain();
+  sink.gain.value = 0;
+  micNode.connect(sink).connect(ctx.destination);
+
+  playNode = new AudioWorkletNode(ctx, 'playback');
+  playNode.port.onmessage = e => {
+    if (e.data.bufferedMs !== undefined)
+      $('m-down').textContent = `${String(e.data.bufferedMs).padStart(3)} ms buf / ${e.data.underruns} ur`;
+  };
+  playNode.connect(ctx.destination);
+  log(`audio up at ${ctx.sampleRate} Hz, base latency ${((ctx.baseLatency || 0) * 1000).toFixed(1)} ms`);
+  $('enable').textContent = 'Microphone ready';
+  $('enable').classList.add('done');
+  $('talk').disabled = false;
+}
+
+/** Every entry point goes through this so a denial or a missing API becomes visible instead of
+ *  vanishing into an unhandled rejection inside a pointer handler. */
+async function ensureAudio() {
+  try {
+    await startAudio();
+    return true;
+  } catch (e) {
+    log('AUDIO FAILED: ' + e.name + ': ' + e.message);
+    setState(e.name === 'NotAllowedError' ? 'mic denied' : 'mic error', 'bad');
+    return false;
+  }
+}
+
+function sendFrame(float32) {
+  if (!ws || ws.readyState !== 1) return;
+  const open = talking || latched;
+  const frame = new Uint8Array(9 + FRAME_SAMPLES);
+  frame[0] = 0x01;
+  new DataView(frame.buffer).setFloat64(1, performance.now(), true);
+  for (let i = 0; i < FRAME_SAMPLES; i++) {
+    const s = open ? Math.max(-1, Math.min(1, float32[i])) : 0;
+    frame[9 + i] = linearToUlaw(Math.round(s * 32767));
+  }
+  ws.send(frame);
+  framesSent++;
+}
+
+// ---- controls ------------------------------------------------------------------------------
+const press = async () => {
+  if (!await ensureAudio()) return;
+  talking = true;
+  $('talk').classList.add('live');
+  $('talk').textContent = 'Talking…';
+};
+const release = () => {
+  talking = false;
+  $('talk').classList.remove('live');
+  $('talk').textContent = 'Hold to talk';
+};
+$('talk').addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+$('talk').addEventListener('pointerup', release);
+$('talk').addEventListener('pointercancel', release);
+$('talk').addEventListener('pointerleave', release);
+
+$('latch').onclick = async () => {
+  if (!await ensureAudio()) return;
+  latched = !latched;
+  $('latch').textContent = latched ? 'Latched — tap to stop' : 'Latch mic on';
+};
+$('monitor').onclick = async () => {
+  if (!await ensureAudio()) return;
+  monitoring = !monitoring;
+  $('monitor').textContent = 'Monitor: ' + (monitoring ? 'on' : 'off');
+};
+$('aec').onclick = async () => {
+  aec = !aec;
+  $('aec').textContent = 'Mic AEC: ' + (aec ? 'on' : 'off');
+  if (ctx) { // re-open the mic with the new constraint
+    micStream.getTracks().forEach(t => t.stop());
+    await ctx.close();
+    ctx = undefined;
+    await ensureAudio();
+  }
+};
+
+// Acoustic round trip, measured in the browser: a 1 kHz burst goes out the uplink, and the
+// camera's own mic stream is watched for it. 0.3 full scale on purpose -- louder trips the
+// camera's ALC and corrupts the very thing being measured.
+$('measure').onclick = async () => {
+  if (!await ensureAudio()) return;
+  $('m-loop').textContent = 'measuring…';
+  const results = [];
+  for (let trial = 0; trial < 5; trial++) {
+    const sentAt = await new Promise(resolve => {
+      let phase = 0, framesLeft = 3, started = 0;
+      const timer = setInterval(() => {
+        if (framesLeft-- <= 0) { clearInterval(timer); resolve(started); return; }
+        const frame = new Uint8Array(9 + FRAME_SAMPLES);
+        frame[0] = 0x01;
+        new DataView(frame.buffer).setFloat64(1, performance.now(), true);
+        for (let i = 0; i < FRAME_SAMPLES; i++) {
+          const v = Math.sin(phase) * 0.3;
+          phase += 2 * Math.PI * 1000 / 8000;
+          frame[9 + i] = linearToUlaw(Math.round(v * 32767));
+        }
+        if (!started) started = performance.now();
+        ws.send(frame);
+      }, 20);
+    });
+    const hit = await new Promise(resolve => {
+      const deadline = setTimeout(() => { loopDetect = null; resolve(null); }, 1200);
+      loopDetect = f => {
+        const k = 2 * Math.cos(2 * Math.PI * 1000 / DOWNLINK_RATE);
+        let s1 = 0, s2 = 0;
+        for (let i = 0; i < f.length; i++) { const s0 = f[i] + k * s1 - s2; s2 = s1; s1 = s0; }
+        const mag = Math.sqrt(Math.max(0, s1 * s1 + s2 * s2 - k * s1 * s2)) / (f.length / 2);
+        if (mag > 0.03) { clearTimeout(deadline); loopDetect = null; resolve(performance.now()); }
+      };
+    });
+    if (hit) results.push(Math.round(hit - sentAt));
+    log(`trial ${trial + 1}: ${hit ? Math.round(hit - sentAt) + ' ms' : 'no return (camera AEC?)'}`);
+    await new Promise(r => setTimeout(r, 600));
+  }
+  $('m-loop').textContent = results.length
+    ? `${Math.min(...results)}–${Math.max(...results)} ms (${results.length}/5)`
+    : 'no return — camera AEC, use ear test';
+};
+
+$('enable').onclick = () => ensureAudio();
+
+$('m-env').textContent = `${window.isSecureContext ? 'secure' : 'INSECURE'} / ` +
+  `${navigator.mediaDevices?.getUserMedia ? 'available' : 'MISSING'}` +
+  `${navigator.audioSession ? ' / audioSession' : ''}`;
+if (!window.isSecureContext)
+  log('NOT a secure context -- iOS will never prompt for the mic over plain http.');
+
+connect();
+</script>
+</body>
+</html>

@@ -431,6 +431,64 @@ is inference from the shared 8 kHz path, not a measurement.
 * Known gap: there is **no mid-call auto-reconnect**. If the camera drops the stream mid-talk the
   call ends and the user presses talk again.
 
+### The direct-path bench, and the number the software is worth (2026-09-20)
+
+`camera-intercom/tools/intercom-lab` is a single-purpose talkback bench for ONE camera (a
+Reolink doorbell), built to answer a question the production path cannot: how much of the delay is
+OURS, and how much is the device? It serves one page over HTTPS, the browser resamples and
+mu-law-encodes its own microphone, and each 20 ms frame goes browser -> WebSocket -> RTP ->
+interleaved TCP with **no ffmpeg, no warm-up lead and no pacing queue**.
+
+Run it with `npm install && npm run build && npm start` in that directory (the build step compiles
+`rtspBackchannel.ts`/`g711.ts` so the bench and the plugin share ONE protocol implementation
+rather than a copy). It needs a trusted HTTPS origin, which is why it is published through
+HomeLabber as `intercom.example.net` rather than a self-signed cert: **iOS Safari will not
+prompt for a microphone on an untrusted origin.**
+
+Measured from an iPhone over that page:
+
+| | |
+|---|---|
+| Our uplink, capture -> socket | **2.4 ms** average, 38 ms peak, over 3537 frames |
+| Acoustic round trip (speaker -> air -> mic -> AAC -> ffmpeg) | **163-280 ms**, median ~205 |
+| Of which the AAC return leg's own framing | 64-128 ms (one AAC frame at 16 kHz; p90 chunk gap 119 ms) |
+
+So the software costs ~2 ms and the device owns the rest. There is nothing left to win on our side
+of this camera, which is the useful conclusion: **stop optimising the pipeline.**
+
+**The finding worth acting on: these cameras drop audio while their speaker path restarts.** With
+the stream stopping between bursts only 4 of 8 were audible at all (and the survivors timed
+incoherently); on one unbroken 20 ms cadence 7 of 8 were audible (only the very first lost) at a
+steady 163-280 ms. That is the "audio cuts out" complaint: every utterance after a pause pays the
+re-initialisation, and pays it with its first word.
+
+Acted on in `onvifBackchannel.ts`: `close()` now **parks** the session and keeps writing silence on
+the same 20 ms cadence for `backchannelKeepAliveMs` (default 20 s, `0` restores the old immediate
+teardown), and the next `open()` for that device adopts it — skipping DESCRIBE/SETUP/PLAY as well,
+since the session never ended. Confirmed in the plugin log: `adopted a still-live backchannel
+session: no RTSP setup, and the device's speaker path never idled`. The linger is shared statically
+across driver instances on purpose — the mixin builds a new driver per talk session, so a
+per-instance field could never span the gap between two utterances.
+
+Three of the bench's own bugs are recorded because each produced confident nonsense:
+* **getUserMedia after an await.** `ctx.resume()` before the mic request loses iOS's user-activation
+  context, and Safari then denies the microphone **without ever prompting** — indistinguishable
+  from a broken page. The mic request must be the first await in the gesture's call stack.
+* **A detector armed during warm-up** attributed a late tone from the PREVIOUS trial to the current
+  one and reported **-203 ms**. An impossible number is the cheapest bug report there is; the fix
+  was one continuous stream with the detector armed throughout, pairing each onset with the last
+  injection before it.
+* **Measuring while a browser was attached.** The page streams silence continuously (that IS the
+  keep-alive), so an injected tone doubled the frame rate into one backchannel and garbled both,
+  reporting "no tone returned at all" — nothing to do with the camera. `/loop` and `/measure` now
+  return `409` while a browser session is streaming.
+
+Two method notes that cost real time: tones are injected at **0.3 full scale**, because
+near-full-scale trips these cameras' ALC and mimics the degradation being measured; and the return
+really is acoustic, proven by setting the camera's speaker to volume 0 via `SetAudioCfg` (tone
+vanished: 0/4 with peaks of 0.00) and restoring it. Without that A/B, a digital loopback inside the
+camera would look identical.
+
 ## Credentials, and how they drift
 
 Three separate secrets, which do NOT change together:
