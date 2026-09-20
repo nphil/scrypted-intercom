@@ -42,13 +42,18 @@ new = '("sendrecv"===(e.offerDirection??e.direction)||"recvonly"===(e.offerDirec
 
 # Two sites use this filter: `setPlaybackInternal` and the "on-demand" audio branch. Both are
 # wrong in the same way, so both are fixed.
+#
+# Idempotent on purpose: re-running must be safe, since this is the recovery step after a plugin
+# update and also how the diagnostics above get stripped. Zero matches means the fix is already
+# in place, which is not an error.
 count = src.count(old)
-if count not in (1, 2):
-    print(f'ABORT: expected one or two transceiver filters, found {count}')
+already = src.count(new)
+if count == 0 and already == 0:
+    print('ABORT: neither the original filter nor the patched form was found -- the bundle has '
+          'changed shape, so re-read it before patching')
     sys.exit(1)
-
 src = src.replace(old, new)
-print(f'sites patched: {count}')
+print(f'sites patched: {count} (already patched: {already})')
 open(PATH, 'w').write(src)
 print('patched: transceiver filter now falls back to direction when offerDirection is unset')
 print('diagnostics removed:', 'TALKBACK-DEBUG' not in src)

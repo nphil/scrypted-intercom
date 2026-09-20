@@ -14,6 +14,7 @@
 // and fully pinned by `agent/src/rtsp.rs`, so a self-contained ~200 line client is more auditable
 // than pulling in a general-purpose RTP/WebRTC dependency for one 12-byte header.
 
+import * as crypto from 'crypto';
 import * as net from 'net';
 
 const ONVIF_BACKCHANNEL = 'www.onvif.org/ver20/backchannel';
@@ -62,11 +63,23 @@ export class RtspBackchannelClient {
     private seq = Math.floor(Math.random() * 0x10000);
     private ssrc = 0x4b424c49; // "KBLI" -- arbitrary but fixed for this client's lifetime.
     private rtpTimestamp = 0;
+    /** Auth state, learned from a 401 and then reused for every later request on this session.
+     * The feeder runs with auth off, which is why this was missing until a camera that requires
+     * it was tried: DESCRIBE simply returned 401 and the driver reported "no backchannel". */
+    private challenge?: { scheme: 'Digest' | 'Basic'; realm: string; nonce: string; qop: string; opaque: string };
+    private nonceCount = 0;
     private videoFramesReceived = 0;
     private micFramesReceived = 0;
     private audioFramesSent = 0;
 
-    constructor(private host: string, private port: number, private mountPath: string, private console: Console) { }
+    constructor(
+        private host: string,
+        private port: number,
+        private mountPath: string,
+        private console: Console,
+        private username = '',
+        private password = '',
+    ) { }
 
     private get baseUrl(): string {
         return `rtsp://${this.host}:${this.port}/${this.mountPath}`;
@@ -78,6 +91,37 @@ export class RtspBackchannelClient {
             micFramesReceived: this.micFramesReceived,
             audioFramesSent: this.audioFramesSent,
         };
+    }
+
+    /** RFC 2617 digest (with or without `qop`), or Basic, per whatever the camera asked for. */
+    private authorizationFor(method: string, url: string): string | undefined {
+        const challenge = this.challenge;
+        if (!challenge || !this.username)
+            return undefined;
+        if (challenge.scheme === 'Basic')
+            return `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`;
+        const md5 = (text: string) => crypto.createHash('md5').update(text).digest('hex');
+        const ha1 = md5(`${this.username}:${challenge.realm}:${this.password}`);
+        const ha2 = md5(`${method}:${url}`);
+        const parts = [
+            `username="${this.username}"`,
+            `realm="${challenge.realm}"`,
+            `nonce="${challenge.nonce}"`,
+            `uri="${url}"`,
+        ];
+        let response: string;
+        if (challenge.qop) {
+            const nc = (++this.nonceCount).toString(16).padStart(8, '0');
+            const cnonce = crypto.randomBytes(8).toString('hex');
+            response = md5(`${ha1}:${challenge.nonce}:${nc}:${cnonce}:auth:${ha2}`);
+            parts.push('qop=auth', `nc=${nc}`, `cnonce="${cnonce}"`);
+        } else {
+            response = md5(`${ha1}:${challenge.nonce}:${ha2}`);
+        }
+        parts.push(`response="${response}"`);
+        if (challenge.opaque)
+            parts.push(`opaque="${challenge.opaque}"`);
+        return `Digest ${parts.join(', ')}`;
     }
 
     async connect(): Promise<void> {
@@ -201,12 +245,29 @@ export class RtspBackchannelClient {
         this.socket!.write(frame);
     }
 
-    private request(method: string, url: string, extraHeaders: Record<string, string> = {}): Promise<RtspResponse> {
+    /** Sends a request, adding auth when the server has asked for it. On the first 401 the
+     * challenge is parsed and the request replayed once -- RTSP auth is per request, and every
+     * method must carry its own digest because the response hashes the METHOD and URI. */
+    private async request(method: string, url: string, extraHeaders: Record<string, string> = {}): Promise<RtspResponse> {
+        const first = await this.sendRequest(method, url, extraHeaders);
+        if (first.code !== 401 || !this.username)
+            return first;
+        const header = first.headers['www-authenticate'];
+        if (!header)
+            return first;
+        this.challenge = parseRtspChallenge(header);
+        return this.sendRequest(method, url, extraHeaders);
+    }
+
+    private sendRequest(method: string, url: string, extraHeaders: Record<string, string> = {}): Promise<RtspResponse> {
         if (!this.socket) throw new Error('rtsp: not connected');
         if (this.pending) throw new Error('rtsp: a request is already in flight on this connection');
         const { promise, resolve, reject } = Promise.withResolvers<RtspResponse>();
         this.pending = { resolve, reject };
         const headers = [`${method} ${url} RTSP/1.0`, `CSeq: ${this.cseq++}`];
+        const authorization = this.authorizationFor(method, url);
+        if (authorization)
+            headers.push(`Authorization: ${authorization}`);
         for (const [key, value] of Object.entries(extraHeaders))
             headers.push(`${key}: ${value}`);
         if (this.session)
@@ -351,4 +412,19 @@ export function parseBackchannelOffer(sdp: string, baseUrl: string): Backchannel
         return candidates[0];
     }
     return undefined;
+}
+
+/** Parses an RTSP `WWW-Authenticate` header into what `authorizationFor` needs. */
+export function parseRtspChallenge(header: string): { scheme: 'Digest' | 'Basic'; realm: string; nonce: string; qop: string; opaque: string } {
+    const scheme = /^\s*Basic/i.test(header) ? 'Basic' : 'Digest';
+    const field = (name: string) => header.match(new RegExp(`${name}\\s*=\\s*"([^"]*)"`, 'i'))?.[1] ?? '';
+    const qopRaw = field('qop') || header.match(/qop\s*=\s*([\w-]+)/i)?.[1] || '';
+    return {
+        scheme,
+        realm: field('realm'),
+        nonce: field('nonce'),
+        // Only `auth` is implemented; `auth-int` would need the body hashed, and no camera here asks.
+        qop: /auth(?![-\w])/i.test(qopRaw) ? 'auth' : '',
+        opaque: field('opaque'),
+    };
 }

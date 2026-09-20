@@ -51,7 +51,8 @@ export class OnvifBackchannelDriver implements IntercomDriver {
     async open(): Promise<void> {
         const port = this.config.rtspPort ?? 554;
         const path = this.config.rtspPath ?? 'sub';
-        const client = new RtspBackchannelClient(this.config.host, port, path, this.config.console);
+        const client = new RtspBackchannelClient(this.config.host, port, path, this.config.console,
+            this.config.username, this.config.password);
         await client.connect();
         const { offered, offer } = await client.describeWithBackchannel();
         if (!offered || !offer) {

@@ -240,6 +240,53 @@ narrower band than 16 kHz ADPCM, but 8 bits per sample against 4, so roughly 38 
 `driverOverrides` entry switches that camera to the standards-based path with this plugin's
 pacing underneath, and the two can be compared by ear.
 
+### Doorbell latency: the lowest-latency path, and where the rest of the delay lives
+
+The doorbells accept BOTH talk protocols, and they are not equal:
+
+| Path | Frames | This plugin's latency | Codec |
+| --- | --- | --- | --- |
+| Baichuan ADPCM 16 kHz | 64 ms | ~205 ms | 4 bits/sample |
+| **ONVIF backchannel PCMU 8 kHz** | **20 ms** | **88-98 ms** | 8 bits/sample |
+
+The backchannel wins on both counts that this plugin controls -- a third of the frame size and
+half the pipeline latency -- and G.711 is 8 bits per sample against ADPCM's 4, so the narrower
+band is not necessarily the worse sound. Front Door runs it (`backchannelOverrides`
+`<host>=554/Preview_01_sub` plus a `driverOverrides` entry) and was confirmed clean by ear.
+
+Reaching it needed a real fix: **the RTSP client never authenticated**. It was written against a
+device with auth disabled, so `DESCRIBE` returned 401 and the driver reported "offers no sendonly
+audio section" -- indistinguishable from a camera that genuinely has no backchannel. It now does
+RFC 2617 digest per method (the response hashes METHOD and URI, so every request carries its own)
+with `qop=auth` or the older no-qop form, and Basic as a fallback.
+
+**The remaining 1-2 s the owner hears is not in this plugin.** Measured: 88-98 ms here, and the
+device's own playback plus the RTSP capture path is a few hundred ms. Reolink's own app is
+similarly laggy on the same doorbell, which puts a large buffer inside the camera's firmware --
+unreachable from any client. What was ruled out along the way: `reolink_aio` (the Home Assistant
+integration's library) implements no talkback at all, its `udp_protocol.py` is P2P discovery
+rather than audio, and the doorbell's CGI exposes only `volume`/`visitorLoudspeaker` for talk
+while `GetTalkAbility` answers "not support". There is no documented or undocumented buffer knob.
+
+### Scrypted app talkback does not work on NVR-recorded cameras
+
+Established by elimination on 2026-09-19, and NOT caused by this plugin:
+
+| Camera | Scrypted NVR mixin | App talkback | HomeKit |
+| --- | --- | --- | --- |
+| Bird, Office | no | works | works |
+| Front Door, Back Door, Cat Feeder | **yes** | nothing happens | works |
+
+With NVR attached the app plays the camera through the NVR pipeline (`starting fork
+@scrypted/nvr`, no WebRTC session in the log at all), and talkback lives inside the WebRTC
+session control -- so there is no talk path to call. Proven by removing the NVR mixin from the
+feeder: app talkback started working immediately, and came back on restoring it.
+
+This is client-side, so it cannot be patched on the server the way the `offerDirection` bug was.
+NVR 0.12.105 dates from August, so unlike that regression it is long-standing behaviour. The
+practical position: **HomeKit is the intercom path for NVR-recorded cameras** and works on every
+one of them; the app works on cameras without NVR.
+
 ### Office camera zoom: another dead capability
 
 `ptzCapabilities` correctly says `{pan:false, tilt:false, zoom:true}`, and Scrypted's `ONVIF PTZ`

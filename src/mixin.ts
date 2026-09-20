@@ -145,6 +145,17 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
         // second of deliberate buffering. These only apply to an RTSP input, so they are added
         // only when the caller actually gave us one.
         const rtspInput = inputArgs.some(arg => arg.startsWith('rtsp://'));
+        // Which client is calling, inferred from the input it handed us. Worth recording: the
+        // camera, driver and encoder are identical for every client, so any difference in the
+        // numbers below belongs to the client stack -- which is exactly the question when one
+        // feels laggier than another. HomeKit names the codec of the phone's stream it re-serves;
+        // the WebRTC path (Scrypted apps and web UI) re-serves over RTSP without naming one; our
+        // own tone tools feed lavfi or a file.
+        const joined = inputArgs.join(' ');
+        const source = /libopus|libfdk_aac/.test(joined) ? 'homekit'
+            : rtspInput ? 'webrtc/app'
+            : /lavfi/.test(joined) ? 'test-tone'
+            : 'file/other';
         const lowLatencyRtsp = rtspInput
             ? ['-max_delay', '0', '-reorder_queue_size', '0', '-rtsp_flags', 'prefer_tcp']
             : [];
@@ -211,7 +222,7 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
         this.console.log(`intercom: queue capped at ${(maxQueued / bytesPerMs).toFixed(0)} ms `
             + `(lead ${leadMs} ms), so latency cannot accumulate beyond that`);
 
-        this.pump = this.pumpAudio(driver, host);
+        this.pump = this.pumpAudio(driver, host, source);
     }
 
     async stopIntercom(): Promise<void> {
@@ -263,7 +274,7 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
      * A device that QUEUES rather than discards gets `format.prebufferMs` written flat out first,
      * giving its player slack that a hardware camera's internal buffer provides for free.
      */
-    private async pumpAudio(driver: IntercomDriver, host: string): Promise<void> {
+    private async pumpAudio(driver: IntercomDriver, host: string, source: string): Promise<void> {
         const { sampleRate, pcmFrameBytes, prebufferMs } = driver.format;
         const frameMs = (pcmFrameBytes / 2 / sampleRate) * 1000;
         const silence = Buffer.alloc(pcmFrameBytes);
@@ -340,7 +351,7 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
             }
         }
         const bytesPerMs = sampleRate * 2 / 1000;
-        const summary = `${driver.name} @ ${host}: ${(filled * frameMs).toFixed(0)} ms silence `
+        const summary = `${source} -> ${driver.name} @ ${host}: ${(filled * frameMs).toFixed(0)} ms silence `
             + `(${stalls} stall(s)), queue peak ${(this.peakQueuedBytes / bytesPerMs).toFixed(0)} ms, `
             + `${(this.droppedBytes / bytesPerMs).toFixed(0)} ms dropped, lead ${leadMs} ms, `
             + `frames ${frameMs.toFixed(0)} ms, OUR LATENCY avg `
