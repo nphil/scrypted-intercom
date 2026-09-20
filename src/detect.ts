@@ -1,9 +1,14 @@
 // Which driver does a given camera need?
 //
 // Detection is by fingerprint, not by guessing from the device name, because the vendors are
-// unambiguous about which port answers what. The standards-based backchannel is tried FIRST so a
-// camera that implements ONVIF properly gets the clean path automatically, and a vendor
-// workaround is only ever used when it has to be.
+// unambiguous about which port answers what.
+//
+// Vendor ports are probed FIRST, and `onvif-backchannel` is reached by an explicit override. That
+// is deliberate, and it is the opposite of what this comment used to claim: where a device offers
+// both, the vendor path has measured BETTER on this hardware. A Reolink doorbell's ONVIF
+// backchannel offers `PCMU/8000` and nothing else, while the same doorbell accepts 16 kHz ADPCM
+// over Baichuan on port 9000 -- twice the bandwidth for the caller's voice. "Standards first" is
+// the right instinct for interoperability and the wrong one for audio quality here.
 //
 // The result is cached in the plugin's storage per host, since it cannot change without a
 // firmware change and probing costs a round trip on every intercom start otherwise.

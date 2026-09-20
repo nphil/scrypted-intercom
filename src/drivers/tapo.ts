@@ -3,6 +3,7 @@
 // plugin 401 forever on some cameras.
 
 import { TapoClient } from '../protocols/tapoClient';
+import { linearToAlaw } from '../protocols/g711';
 import { DriverConfig, IntercomDriver, TalkFormat } from './driver';
 
 const PCMA_RATE = 8000;
@@ -63,17 +64,3 @@ export class TapoDriver implements IntercomDriver {
 
 /** ITU-T G.711 A-law encoder. Inline because it is a dozen lines and keeps this plugin free of
  * audio dependencies. */
-function linearToAlaw(pcm: Buffer): Buffer {
-    const out = Buffer.alloc(pcm.length / 2);
-    for (let i = 0; i < out.length; i++) {
-        const sample = pcm.readInt16LE(i * 2);
-        const sign = sample < 0 ? 0x00 : 0x80;
-        const magnitude = Math.min(32635, Math.abs(sample));
-        let exponent = 7;
-        for (let mask = 0x4000; exponent > 0 && !(magnitude & mask); mask >>= 1)
-            exponent--;
-        const mantissa = (magnitude >> (exponent === 0 ? 4 : exponent + 3)) & 0x0F;
-        out[i] = (sign | (exponent << 4) | mantissa) ^ 0x55;
-    }
-    return out;
-}

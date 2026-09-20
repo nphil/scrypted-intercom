@@ -2,7 +2,7 @@
 //
 // Ported from a working Python prototype (a thin wrapper around `reolink_aio`'s Baichuan client,
 // preserved at /tmp/hatalk_standalone.py) that was proven to drive two-way audio on a Reolink
-// RLC-833A (the test camera, fw v3.1.0.3016_2312052457) -- the camera owner confirmed the audio
+// RLC-833A (10.0.0.12, fw v3.1.0.3016_2312052457) -- the camera owner confirmed the audio
 // audible standing in the room. Every constant and byte layout below comes from that prototype,
 // cross-referenced against the public Baichuan header layout (neolink, reolink_aio,
 // github.com/TinKurbatoff/reolink-init); none of it is re-derived, because this protocol has no

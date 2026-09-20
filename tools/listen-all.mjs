@@ -24,7 +24,7 @@ for (const name of process.argv.slice(2)) {
     if (!cam) { console.log(`>>> ${name}: NOT FOUND`); continue; }
 
     const media = await sdk.mediaManager.createFFmpegMediaObject({
-        inputArguments: ['-re', '-f', 'lavfi', '-i', `sine=frequency=1000:duration=${SECONDS}`, '-af', 'volume=6.3'],
+        inputArguments: ['-re', '-f', 'lavfi', '-i', `sine=frequency=1000:duration=${SECONDS}:samples_per_frame=160`, '-af', 'volume=2.4'],
     });
     console.log(`>>> ${name}: ${SECONDS}s tone`);
     try {

@@ -55,7 +55,7 @@ Two Scrypted devices come from the plugin: **Camera Intercom** (the talkback mix
 PTZ** (a separate mixin provider — `canMixin` cannot see the device, so one combined provider
 would advertise dead `PanTiltZoom` on cameras that have none).
 
-Deployed to Scrypted at `https://scrypted.local:10443` (BeastNAS, tailnet) with
+Deployed to Scrypted at `https://scrypted.local:10443` (the author's server, over a tailnet) with
 `npx scrypted-deploy`.
 
 Not ours, deliberately left alone: **Back Door** and **Front Door** are Reolink *doorbells*,
@@ -148,6 +148,171 @@ plugin rather than the first-party one:
    reports `current`.
 
 Full notes in `camera-intercom/src/protocols/tapoClient.ts`.
+
+## The doorbells, and what "poor quality/latency" actually was (2026-09-19)
+
+Front Door and Back Door are **Reolink Video Doorbell PoE-W** (fw v3.0.0.6460), wired PoE. They
+were on the stock `@scrypted/reolink` intercom, which works -- but over the ONVIF backchannel,
+and that backchannel offers **`PCMU/8000` only** (read from the device's own SDP). Their vendor
+protocol on port 9000 carries **16 kHz ADPCM**, so both are now on the `reolink` driver: double
+the bandwidth for the caller's voice, plus this plugin's pacing.
+
+Upstream's `onvif-intercom.ts` also holds three latency costs this path does not:
+
+| Stock ONVIF intercom | This plugin |
+| --- | --- |
+| aggregates packets up to **160 ms** before sending | 64 ms frames, sent when due |
+| holds **one packet back permanently** (`pending`), so an utterance's last packet waits for the next | no hold |
+| forwards RTP with no pacing or jitter handling -- HomeKit's jitter reaches the device as cut-outs | paced, debt-free, silence-filled |
+| no warm-up, so the device eats the first words | 300 ms of silence first |
+
+### Latency, measured rather than guessed
+
+Reported symptom was 1-2 s from speaking to hearing it. The plugin now records every session
+(`Recent Talk Sessions` setting, or `node tools/sessions.mjs`), including **`OUR LATENCY`**: the
+age of the audio at the moment it goes on the wire, which is exactly this pipeline's contribution.
+
+* **Ours: 109-114 ms average, 160-190 ms peak** -- close to the lead, as designed.
+* A **latency cap** replaced an earlier memory cap. The queue was bounded at 3 s (raised while
+  worrying about clipping the caller's first word), and since the pump drains at exactly real time
+  and never faster, any burst from the source became a backlog that persisted for the whole
+  session. It is now `lead + 120 ms`, and audio beyond that is dropped rather than carried as
+  delay.
+* The **warm-up no longer builds a backlog**: it discards what arrives during the window instead
+  of queueing it behind the silence. Before, a session opened by sending silence while real audio
+  piled up, then threw ~600 ms of it away to hold the cap -- measured as +780 ms of added delay.
+* **Low-latency RTSP input flags** (`-max_delay 0 -reorder_queue_size 0`) are added when the
+  caller hands us an `rtsp://` input, which HomeKit always does: it re-serves the phone's Opus
+  through a local RTSP server, and ffmpeg's RTSP demuxer defaults to half a second of buffering.
+* Wired devices run a **120 ms lead** instead of 250 ms (`leadOverrides`, per host: both doorbells
+  and the Office camera). Confirmed clean by ear at 120 ms. The wifi cameras keep the default,
+  where the lead absorbs real jitter.
+
+Remaining delay is not in this plugin: HomeKit encodes Opus on the phone, ships it over wifi to
+Scrypted, Scrypted re-serves it through a local RTSP server, we decode and re-encode, then the
+device buffers before its speaker. A differential measurement (same tone, once through a direct
+Baichuan sender and once through Scrypted, both captured in one recording off the camera's own
+RTSP audio) put the whole Scrypted path at +778 ms *at session start*; steady-state ours is the
+109-114 ms above.
+
+### Four artifacts chased on the Office camera, and what each actually was (2026-09-19)
+
+All four presented as "the audio sounds wrong", and only two were this plugin's fault. Worth
+reading before tuning anything here, because three of them are instrument or device behaviour:
+
+| Reported as | Cause | Resolution |
+| --- | --- | --- |
+| "two tones overlaid", crackle | the latency cap had been tightened below the source's normal burst (~206 ms real clients, ~450 ms from lavfi), so it trimmed mid-stream; every trim is a discontinuity | trim only where it cannot be heard |
+| "slight repeating rattle" | same cause, smaller | same fix; `dropped` in the telemetry is the check, and it should read 0 |
+| "started loud, went quiet, garbled at the end" | the startup lump (~700 ms) was carried as standing delay for the whole session, so the device ran with a permanent backlog | shed the excess at PRIME time, where nothing has been sent yet and dropping is inaudible; latency went 592 ms -> 114 ms |
+| "loud start then immediately quieter" | the CAMERA's automatic level control clamping a near-full-scale tone about a second in | not a fault; the tone tools now generate ~0.3 FS, below the knee |
+
+Catch-up policy, as it now stands: the queue is bounded by latency (`lead + 150 ms`, floor
+250 ms), and exceeding it drops the oldest audio **only when that audio is quiet** -- a pause
+between words, which conversation supplies constantly. A caller who never pauses keeps their
+latency rather than hearing holes punched in their speech, and the delay is recovered at the next
+breath. A hard ceiling (1.2 s) still drops regardless, because past that the delay is worse than
+a glitch. Priming is the exception: there the excess is dropped unconditionally, since no audio
+has been sent yet and trimming only chooses where the stream starts.
+
+Pacing holds the exact frame period on average and resyncs only after a gap larger than
+`RESYNC_THRESHOLD_MS` (1 s). Resetting the clock on ordinary lateness makes the period
+"frameMs + processing time", which starves the device slowly.
+
+### The Office camera's audio ceiling is the device, not this code
+
+Speech through the Office camera sounds tinny and gritty. That is the protocol, and it is worth
+recording so it is not chased again:
+
+* Its only talk path is Baichuan **IMA ADPCM, 4 bits per sample**. The camera exposes no ONVIF
+  backchannel at all (Reolink cameras do not; only their doorbells do), so there is no 8-bit
+  G.711 alternative to switch to -- `onvif-backchannel` against it fails with "offers no sendonly
+  audio section", which is the correct answer, not a bug.
+* Our encoder is not the problem: a round trip through it measures **27.6 dB SNR**, at the top of
+  what 4-bit IMA ADPCM achieves. Verified by decoding our own blocks with the standard IMA
+  algorithm and comparing against the input.
+* **Reolink's own app sounds equally bad on the same camera** (owner's judgement). That is the
+  ceiling, and we are at parity with the vendor.
+
+Note wider is not automatically better here. The doorbells' ONVIF backchannel offers `PCMU/8000`:
+narrower band than 16 kHz ADPCM, but 8 bits per sample against 4, so roughly 38 dB SNR against
+27 dB. If a doorbell ever sounds gritty, `backchannelOverrides` (`host=port/path`) plus a
+`driverOverrides` entry switches that camera to the standards-based path with this plugin's
+pacing underneath, and the two can be compared by ear.
+
+### Office camera zoom: another dead capability
+
+`ptzCapabilities` correctly says `{pan:false, tilt:false, zoom:true}`, and Scrypted's `ONVIF PTZ`
+mixin accepted `ptzCommand` and returned success while the lens **never moved** -- verified with
+the camera's own `GetZoomFocus` readback (21 before, 21 after). It also accepted *pan* commands on
+a camera that reports no pan. The same move over Reolink's CGI went 4 -> 21.
+
+Office now uses this plugin's `Vendor PTZ` over `protocols/reolinkCgi.ts` (timed `ZoomInc`/
+`ZoomDec` bursts plus a mandatory `Stop`), with the ONVIF PTZ mixin detached. Verified through the
+Scrypted UI's own buttons: 11 -> 5 -> 12. Every zoom logs its before/after position, so a silent
+no-op cannot hide again.
+
+### Mixin ORDER matters: providers before consumers
+
+A Scrypted mixin sees the device as it exists BELOW itself (`mixinDeviceInterfaces`), and consumers
+decide what to offer from that view -- the WebRTC plugin negotiates its audio as `sendrecv` only
+when it can see `Intercom`, `recvonly` otherwise. With this plugin's mixin applied last, WebRTC
+could not see it. `tools/reorder-mixins.mjs` moves `Camera Intercom` and `Vendor PTZ` to the front
+of every camera's chain; run it after attaching to a new camera.
+
+Note this was masked while the vendors' broken two-way flags were still on: they made the base
+device advertise `Intercom` (a dead capability, but a visible one), so consumers saw it.
+
+### Scrypted app talkback: a real bug in @scrypted/webrtc, and the local fix
+
+**Symptom:** talkback from the Scrypted iOS and Android apps did nothing, on every camera --
+including the **Ring** doorbell, whose intercom has nothing to do with this plugin. HomeKit
+talkback worked everywhere throughout.
+
+**Root cause** (found 2026-09-19 by instrumenting the installed plugin). `setPlaybackInternal` in
+`@scrypted/webrtc` 0.2.89 picks the transceiver to receive the caller's microphone on:
+
+```js
+find(e => "audio" === e.receiver.track.kind &&
+     ("sendrecv" === e.offerDirection || "recvonly" === e.offerDirection))
+```
+
+`offerDirection` is werift's record of a direction that arrived in a REMOTE offer. Scrypted's own
+apps let the SERVER generate the offer, so it is `undefined` -- while the transceiver's own
+`direction` is `sendrecv`. The find matches nothing and the function returns. Every failure path
+in it is a bare `return`, so there is no log and no error anywhere:
+
+```
+TALKBACK-DEBUG 1 setPlayback called, options={"audio":true,"video":true} killed=false hasIntercom=true
+TALKBACK-DEBUG 2 transceiver found=false offerDirection=undefined
+              allDirections=[{"kind":"video","dir":"sendonly"},{"kind":"audio","dir":"sendrecv"}]
+TALKBACK-DEBUG 2a BAILED: no audio transceiver offering sendrecv/recvonly
+```
+
+**Fix:** fall back to `direction` when `offerDirection` is unset -- the same information from the
+local side of the negotiation. Applied to both sites that use the filter (`setPlaybackInternal`
+and the `on-demand` audio branch):
+
+```sh
+cd camera-intercom
+SCRYPTED_URL=… SCRYPTED_USER=… SCRYPTED_PASS=… tools/apply-webrtc-patch.sh
+```
+
+Confirmed working afterwards from the iOS app over Tailscale: `OUR LATENCY avg 96-127 ms`.
+
+**This patch edits an installed plugin bundle and a WebRTC plugin update WILL wipe it.** The
+untouched file is kept as `main.nodejs.js.orig` inside the container; re-run the script above
+after an update, and check first whether upstream has fixed it. Worth reporting upstream: the
+same one-line change in `plugins/webrtc/src/session-control.ts` fixes it for everyone.
+
+**How much time this cost, and the lesson:** several wrong turns were taken first -- mixin
+ordering, stream transcoding, the queue cap, the remote/Tailscale path -- because the failure was
+completely silent. The thing that actually solved it was instrumenting the three bare `return`s.
+When a code path has no logging and the symptom is "nothing happens", add the logging first
+instead of forming theories about the parts that do log. Two supporting habits paid off here:
+this plugin records EVERY `startIntercom` (so "the app never reaches us" was a fact, not a
+guess), and testing the **Ring** camera -- a device this plugin does not touch -- proved the
+fault was not ours before any code was changed.
 
 ## Quality, latency and reliability — measured
 

@@ -10,7 +10,8 @@
 // Known to work with: the Kibble feeder (whose RTSP server implements it deliberately), and
 // per Scrypted's own camera support notes, Amcrest/Dahua, Hikvision and Reolink doorbells.
 
-import { RtspBackchannelClient } from '../protocols/rtspBackchannel';
+import { BackchannelOffer, RtspBackchannelClient } from '../protocols/rtspBackchannel';
+import { linearToAlaw, linearToUlaw } from '../protocols/g711';
 import { DriverConfig, IntercomDriver, TalkFormat } from './driver';
 
 /** L16/16000 mono: 320 samples is 20 ms, and 2 bytes per sample. Wideband end to end — no G.711
@@ -37,9 +38,12 @@ export class OnvifBackchannelDriver implements IntercomDriver {
      * it generally does record its own speaker; the self-test can be trusted. */
     readonly echoCancels = false;
     readonly notes: string[] = [];
-    readonly format: TalkFormat = { sampleRate: L16_RATE, pcmFrameBytes: L16_FRAME_BYTES, prebufferMs: PREBUFFER_MS };
+    /** Filled in by `open()` from the device's own SDP: the rate is whatever it offered, so this
+     * is not final until the session exists. The mixin reads `format` after `open()`. */
+    format: TalkFormat = { sampleRate: L16_RATE, pcmFrameBytes: L16_FRAME_BYTES, prebufferMs: PREBUFFER_MS };
 
     private client?: RtspBackchannelClient;
+    private offer?: BackchannelOffer;
     private pending = Buffer.alloc(0);
 
     constructor(private config: DriverConfig) { }
@@ -49,13 +53,14 @@ export class OnvifBackchannelDriver implements IntercomDriver {
         const path = this.config.rtspPath ?? 'sub';
         const client = new RtspBackchannelClient(this.config.host, port, path, this.config.console);
         await client.connect();
-        const { offered } = await client.describeWithBackchannel();
-        if (!offered) {
+        const { offered, offer } = await client.describeWithBackchannel();
+        if (!offered || !offer) {
             client.close();
             throw new Error(`onvif-backchannel: ${this.config.host}:${port}/${path} offers no `
-                + 'sendonly audio section, so it has no backchannel to push into');
+                + 'sendonly audio section in a codec this driver can produce, so there is no '
+                + 'backchannel to push into');
         }
-        const setup = await client.setupBackchannel('tcp');
+        const setup = await client.setupBackchannel('tcp', offer.control);
         if (setup.code !== 200) {
             client.close();
             throw new Error(`onvif-backchannel: SETUP failed: ${setup.code} ${setup.reason}`);
@@ -66,21 +71,38 @@ export class OnvifBackchannelDriver implements IntercomDriver {
             throw new Error(`onvif-backchannel: PLAY failed: ${play.code} ${play.reason}`);
         }
         this.client = client;
+        this.offer = offer;
         this.pending = Buffer.alloc(0);
-        this.notes.push(`backchannel negotiated over RTP/AVP/TCP interleaved, L16/${L16_RATE}`);
+        // 20 ms frames at the device's own clock: short enough to keep latency low, long enough
+        // that the per-frame RTP overhead stays irrelevant.
+        const samplesPerFrame = Math.round(offer.clock / 50);
+        this.format = {
+            sampleRate: offer.clock,
+            pcmFrameBytes: samplesPerFrame * 2,
+            prebufferMs: PREBUFFER_MS,
+        };
+        this.notes.push(`backchannel negotiated over RTP/AVP/TCP interleaved, `
+            + `${offer.codec}/${offer.clock} (payload type ${offer.payloadType}) at ${offer.control}`);
     }
 
     async write(pcm: Buffer): Promise<void> {
         const client = this.client;
-        if (!client)
+        const offer = this.offer;
+        if (!client || !offer)
             return;
-        // L16 is big-endian on the wire; ffmpeg hands us little-endian.
+        const frameBytes = this.format.pcmFrameBytes;
         this.pending = Buffer.concat([this.pending, pcm]);
-        while (this.pending.length >= L16_FRAME_BYTES) {
-            const frame = Buffer.from(this.pending.subarray(0, L16_FRAME_BYTES));
-            frame.swap16();
-            client.sendL16Frame(frame);
-            this.pending = this.pending.subarray(L16_FRAME_BYTES);
+        while (this.pending.length >= frameBytes) {
+            const pcmFrame = Buffer.from(this.pending.subarray(0, frameBytes));
+            this.pending = this.pending.subarray(frameBytes);
+            let payload: Buffer;
+            if (offer.codec === 'L16') {
+                pcmFrame.swap16(); // L16 is big-endian on the wire; ffmpeg hands us little-endian
+                payload = pcmFrame;
+            } else {
+                payload = offer.codec === 'PCMU' ? linearToUlaw(pcmFrame) : linearToAlaw(pcmFrame);
+            }
+            client.sendOfferedFrame(offer, payload);
         }
     }
 

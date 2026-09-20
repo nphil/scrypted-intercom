@@ -20,7 +20,7 @@ for (const name of process.argv.slice(2)) {
     if (!cam) { console.log(`${name.padEnd(20)} NOT FOUND`); continue; }
     let talk = 'n/a', ptz = 'n/a';
     const media = await sdk.mediaManager.createFFmpegMediaObject({
-        inputArguments: ['-re', '-f', 'lavfi', '-i', 'sine=frequency=1000:duration=3'],
+        inputArguments: ['-re', '-f', 'lavfi', '-i', 'sine=frequency=1000:duration=3:samples_per_frame=160'],
     });
     try {
         await cam.startIntercom(media);
@@ -32,10 +32,14 @@ for (const name of process.argv.slice(2)) {
     }
     if ((cam.interfaces || []).includes('PanTiltZoom')) {
         try {
-            await cam.ptzCommand({ movement: 'Relative', pan: 0.15 });
-            await sleep(1200);
-            await cam.ptzCommand({ movement: 'Relative', pan: -0.15 });
-            ptz = 'OK';
+            // Exercise an axis the camera actually has: a zoom-only camera correctly refuses pan,
+            // and testing the wrong axis reports a working camera as broken.
+            const caps = cam.ptzCapabilities || {};
+            const axis = caps.pan ? 'pan' : caps.tilt ? 'tilt' : 'zoom';
+            await cam.ptzCommand({ movement: 'Relative', [axis]: 0.15 });
+            await sleep(1500);
+            await cam.ptzCommand({ movement: 'Relative', [axis]: -0.15 });
+            ptz = `OK (${axis})`;
         } catch (e) {
             ptz = `FAIL: ${e.message.slice(0, 60)}`;
         }

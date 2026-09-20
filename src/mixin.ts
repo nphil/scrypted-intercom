@@ -13,14 +13,41 @@ import { DriverConfig, IntercomDriver } from './drivers/driver';
 import { resolveHost } from './ptzMixin';
 import { sdk } from './sdkFix';
 
-/** Bound the queue so a bursty producer costs latency, not unbounded memory.
+/** How much audio may sit queued ahead of the pump, as a multiple of the lead, plus a floor.
  *
- * Trimming discards the OLDEST audio, which for live talkback is the right end to lose -- but it
- * is also, literally, the start of the caller's sentence, so the cap must be generous enough that
- * ordinary jitter never reaches it. At these rates a second of audio is ~16 KB, so headroom is
- * nearly free and the cap is set well above the opening padding (WARMUP_MS + LEAD_MS) plus any
- * plausible transcoder stall. */
-const MAX_QUEUED_SECONDS = 3;
+ * This bounds LATENCY, which is the thing that matters -- an earlier version bounded memory
+ * instead (3 seconds' worth) and that was a mistake with a directly audible cost: the pump drains
+ * at exactly real time and never faster, so any burst from the source becomes a backlog that
+ * persists for the whole session. Measured over HomeKit on a doorbell: 1-2 seconds between
+ * speaking and hearing it, none of which was the device or the network.
+ *
+ * When the queue exceeds the target the OLDEST audio goes, because in a live conversation the
+ * freshest audio is the only audio worth hearing; dropping a moment is strictly better than
+ * talking into a growing delay. The source and sink both run at real time, so this only triggers
+ * when the source genuinely runs ahead.
+ *
+ * The target must stay ABOVE the source's normal burst size, or it trims continuously, and each
+ * trim is a discontinuity -- on a continuous tone that is an audible phase jump, reported as "two
+ * tones overlaid" with crackle. Real clients (HomeKit, the Scrypted app) were measured bursting to
+ * ~206 ms, so the target sits above that. It is deliberately NOT sized for ffmpeg's `lavfi` test
+ * source, which delivers in much larger lumps (~450 ms) and would drag the standing latency to
+ * ~350 ms if it set the budget; the tone tools ask lavfi for small frames instead. The drop
+ * counter in the session telemetry is the check: it should be zero on a healthy source. */
+const QUEUE_TARGET_SLACK_MS = 150;
+const QUEUE_TARGET_FLOOR_MS = 250;
+/** How far behind schedule the pump may fall before it gives up on catching up and resyncs.
+ *
+ * Deliberately large. Resetting the clock on ordinary lateness is what made the sink run slower
+ * than real time -- the frame period became "frameMs + whatever the write cost" -- so the backlog
+ * grew all session and the device was starved. Ordinary lateness is therefore caught up by
+ * sending the next frame immediately; only a gap no catch-up could cover starts a new clock. */
+const RESYNC_THRESHOLD_MS = 1000;
+/** Past this the delay is worse than a glitch, so audio is dropped whatever its level. */
+const QUEUE_HARD_CEILING_MS = 1200;
+/** Below this RMS a chunk is treated as a pause, and is what catch-up is allowed to discard.
+ * ~1% of full scale: comfortably above a quiet room's noise floor through these codecs, well
+ * below speech. */
+const QUIET_RMS = 300;
 /** Silence sent immediately after the talk session opens, before any real audio.
  *
  * These devices are not ready to play the moment they accept a session: audio sent in the first
@@ -29,14 +56,22 @@ const MAX_QUEUED_SECONDS = 3;
  * cleanly. Feeding SILENCE through that window instead means the loss lands on silence and the
  * caller's first words survive. It costs no added latency for the caller, unlike buffering real
  * audio ahead of the first frame, which is what made this worse. */
-const WARMUP_MS = 300;
+export const DEFAULT_WARMUP_MS = 300;
 /** Audio to hold before real frames start flowing, and to re-earn after the source stalls.
  *
  * ffmpeg's first read arrives as an early lump followed by a pause, so playing audio the instant
  * any exists reproduces that shape audibly. This is latency added to the front of a talk session,
  * so it stays small -- large enough to cover transcoder startup, small enough to stay unnoticed
- * next to the WARMUP_MS of silence that already precedes it. */
-const LEAD_MS = 250;
+ * next to the warm-up silence that already precedes it. */
+export const DEFAULT_LEAD_MS = 250;
+
+/** The two timings above, resolved per talk session so they can be tuned against real hardware
+ * without a rebuild. A wired device on a quiet LAN tolerates a much smaller lead than a camera
+ * behind wifi, and the right value is a property of the install, not of this code. */
+export interface PumpTiming {
+    warmupMs: number;
+    leadMs: number;
+}
 
 export type DriverFactory = (host: string, console: Console) => Promise<IntercomDriver>;
 
@@ -45,12 +80,23 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
     private ffmpeg?: child_process.ChildProcess;
     private pump?: Promise<void>;
     private stopping = false;
-    private queue: Buffer[] = [];
+    private queue: { chunk: Buffer; at: number }[] = [];
     private queuedBytes = 0;
+    /** Session telemetry: how deep the queue got, and how much had to be dropped to hold the
+     * latency target. Both are reported at stop, because "1-2 seconds of delay" is otherwise
+     * impossible to attribute between this process, the caller's network and the device. */
+    private peakQueuedBytes = 0;
+    private droppedBytes = 0;
+    /** Age-at-send accumulators: this pipeline's own latency contribution, in milliseconds. */
+    private ageSumMs = 0;
+    private ageSamples = 0;
+    private peakAgeMs = 0;
 
     constructor(
         options: MixinDeviceOptions<VideoCamera & Partial<Settings>>,
         private createDriver: DriverFactory,
+        private timing: (host: string) => PumpTiming,
+        private report: (line: string) => void,
     ) {
         super(options);
     }
@@ -61,8 +107,11 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
         const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
 
         const host = await resolveHost(this.mixinDevice);
+        const tStart = Date.now();
         const driver = await this.createDriver(host, this.console);
+        const tDriverCreated = Date.now();
         await driver.open();
+        const tDriverOpen = Date.now();
         this.driver = driver;
         const format = driver.format;
         this.console.log(`intercom: ${driver.name} talking to ${host} at ${format.sampleRate} Hz, `
@@ -90,8 +139,18 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
         const ffmpegPath = await sdk.mediaManager.getFFmpegPath();
         const resampler = await hasSoxr(ffmpegPath, this.console);
         const inputArgs = ffmpegInput.inputArguments?.length ? ffmpegInput.inputArguments : ['-i', ffmpegInput.url!];
+        // HomeKit delivers talkback as an rtsp:// input (it stands up a local RTSP server and
+        // re-serves the phone's Opus through it), and ffmpeg's RTSP demuxer defaults are tuned for
+        // playback smoothness rather than for a live conversation: `max_delay` alone is half a
+        // second of deliberate buffering. These only apply to an RTSP input, so they are added
+        // only when the caller actually gave us one.
+        const rtspInput = inputArgs.some(arg => arg.startsWith('rtsp://'));
+        const lowLatencyRtsp = rtspInput
+            ? ['-max_delay', '0', '-reorder_queue_size', '0', '-rtsp_flags', 'prefer_tcp']
+            : [];
         const args = [
             '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32', '-analyzeduration', '0',
+            ...lowLatencyRtsp,
             ...inputArgs,
             '-vn', '-sn', '-dn',
             '-acodec', 'pcm_s16le', '-ar', String(format.sampleRate), '-ac', '1',
@@ -99,20 +158,60 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
             '-dither_method', 'triangular',
             '-f', 's16le', '-flush_packets', '1', 'pipe:1',
         ];
+        const tSpawn = Date.now();
         const proc = child_process.spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
         this.ffmpeg = proc;
+        let firstByteLogged = false;
         proc.stderr?.resume(); // ffmpeg logs to stderr even on a clean run; nothing here is actionable
         proc.on('exit', code => this.console.log(`intercom: ffmpeg exited (code ${code})`));
 
-        const maxQueued = format.sampleRate * 2 * MAX_QUEUED_SECONDS;
+        // Bound the queue by LATENCY, not by memory: see QUEUE_TARGET_* above.
+        //
+        // Trimming is deliberately CONDITIONAL. Discarding audio mid-sound is audible -- each
+        // drop is a discontinuity, and a run of them was reported as "two tones overlaid" and
+        // then as "a slight repeating rattle" while tuning the target. So catch-up happens where
+        // it cannot be heard: only the oldest chunk is dropped, only when that chunk is quiet
+        // (a pause between words, which a real conversation supplies constantly). A caller who
+        // never pauses keeps their latency instead of hearing damage -- the right trade, since
+        // the delay is recovered at the next breath.
+        //
+        // A hard ceiling still exists so a pathological source cannot grow the delay without
+        // bound; past it, audio is dropped regardless of level.
+        const { leadMs } = this.timing(host);
+        const bytesPerMs = format.sampleRate * 2 / 1000;
+        const maxQueued = Math.ceil(Math.max(QUEUE_TARGET_FLOOR_MS, leadMs + QUEUE_TARGET_SLACK_MS) * bytesPerMs);
+        const hardCeiling = Math.ceil(QUEUE_HARD_CEILING_MS * bytesPerMs);
+        this.droppedBytes = 0;
+        this.peakQueuedBytes = 0;
+        this.ageSumMs = 0;
+        this.ageSamples = 0;
+        this.peakAgeMs = 0;
         proc.stdout?.on('data', (chunk: Buffer) => {
-            this.queue.push(chunk);
+            const at = Date.now();
+            if (!firstByteLogged) {
+                firstByteLogged = true;
+                this.console.log(`intercom: startup -- driver create ${tDriverCreated - tStart} ms, `
+                    + `driver open ${tDriverOpen - tDriverCreated} ms, ffmpeg spawn to first audio `
+                    + `${Date.now() - tSpawn} ms (total ${Date.now() - tStart} ms before any real `
+                    + 'audio could be sent)');
+            }
+            this.queue.push({ chunk, at });
             this.queuedBytes += chunk.length;
-            while (this.queuedBytes > maxQueued && this.queue.length > 1)
-                this.queuedBytes -= this.queue.shift()!.length;
+            if (this.queuedBytes > this.peakQueuedBytes)
+                this.peakQueuedBytes = this.queuedBytes;
+            while (this.queuedBytes > maxQueued && this.queue.length > 1) {
+                const head = this.queue[0].chunk;
+                if (this.queuedBytes <= hardCeiling && !isQuiet(head))
+                    break; // audible: carry the latency rather than punch a hole in speech
+                this.queue.shift();
+                this.queuedBytes -= head.length;
+                this.droppedBytes += head.length;
+            }
         });
+        this.console.log(`intercom: queue capped at ${(maxQueued / bytesPerMs).toFixed(0)} ms `
+            + `(lead ${leadMs} ms), so latency cannot accumulate beyond that`);
 
-        this.pump = this.pumpAudio(driver);
+        this.pump = this.pumpAudio(driver, host);
     }
 
     async stopIntercom(): Promise<void> {
@@ -143,15 +242,16 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
      * audible here is this pipeline's doing, not the device's or the protocol's.
      *
      * 1. The stream is CONTINUOUS. When there is nothing to send the frame is silence, never a
-     *    hole, and the session opens on WARMUP_MS of silence: a device drops audio while its
+     *    hole, and the session opens on the warm-up of silence: a device drops audio while its
      *    speaker path comes up, and silence is what should land in that window. Sending real audio
      *    into it was heard on the Reolink as "beep, gap, steady tone".
      *
-     * 2. Pacing NEVER accumulates debt. Frames are due on a monotonic clock so transcode jitter
-     *    cannot drift, but falling behind resets the clock to now instead of firing frames back to
-     *    back. Every device here discards audio arriving faster than real time, so a catch-up
-     *    burst is thrown away and heard as a gap -- and this is live audio, so there is nothing to
-     *    catch up to.
+     * 2. Pacing holds the EXACT frame period on average, and only resyncs after a gross gap
+     *    (RESYNC_THRESHOLD_MS). Ordinary lateness is caught up by sending the next frame
+     *    immediately. Resetting the clock on every small delay instead makes the period
+     *    "frameMs + processing time", so the sink runs slower than real time and the backlog
+     *    grows for the whole session -- audibly, as sound that starts fine then degrades. An
+     *    UNDERRUN is the one case with nothing to catch up to, and silence is sent for it.
      *
      * 3. Real audio only flows once a LEAD exists, and a stall re-earns it. ffmpeg does not begin
      *    smoothly: its first read lands early as a lump, then pauses before reaching steady state.
@@ -163,11 +263,12 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
      * A device that QUEUES rather than discards gets `format.prebufferMs` written flat out first,
      * giving its player slack that a hardware camera's internal buffer provides for free.
      */
-    private async pumpAudio(driver: IntercomDriver): Promise<void> {
+    private async pumpAudio(driver: IntercomDriver, host: string): Promise<void> {
         const { sampleRate, pcmFrameBytes, prebufferMs } = driver.format;
         const frameMs = (pcmFrameBytes / 2 / sampleRate) * 1000;
         const silence = Buffer.alloc(pcmFrameBytes);
-        const leadBytes = Math.max(pcmFrameBytes, Math.ceil(LEAD_MS / frameMs) * pcmFrameBytes);
+        const { warmupMs, leadMs } = this.timing(host);
+        const leadBytes = Math.max(pcmFrameBytes, Math.ceil(leadMs / frameMs) * pcmFrameBytes);
 
         // Unpaced prebuffer: silence written as fast as the socket takes it, so the device's own
         // player starts with slack instead of running on the edge of underrun. It doubles as the
@@ -178,7 +279,7 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
         if (prebufferFrames)
             this.console.log(`intercom: prebuffered ${(prebufferFrames * frameMs).toFixed(0)} ms of silence unpaced`);
 
-        let warmupFrames = Math.max(0, Math.round(WARMUP_MS / frameMs) - prebufferFrames);
+        let warmupFrames = Math.max(0, Math.round(warmupMs / frameMs) - prebufferFrames);
         let primed = false;
         let filled = 0;
         let stalls = 0;
@@ -188,6 +289,13 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
             let frame: Buffer<ArrayBufferLike> = silence;
             if (warmupFrames > 0) {
                 warmupFrames--;
+                // Stay CURRENT through the warm-up instead of letting audio queue up behind the
+                // silence. The device is dropping whatever arrives in this window anyway, so
+                // queueing it only buys latency that persists for the rest of the session: it was
+                // measured as ~780 ms of added delay with ~600 ms of caller audio discarded a
+                // moment later to hold the latency cap. Discarding it here costs the same audio
+                // and none of the delay.
+                this.take(Math.min(this.queuedBytes, pcmFrameBytes));
             }
             else if (primed && this.queuedBytes >= pcmFrameBytes) {
                 frame = this.take(pcmFrameBytes);
@@ -198,40 +306,76 @@ export class CameraIntercomMixin extends MixinDeviceBase<VideoCamera & Partial<S
                     primed = false;
                     stalls++;
                 }
-                if (this.queuedBytes >= leadBytes)
+                // Priming is the one moment when trimming is free: nothing has been sent yet, so
+                // dropping the excess cannot produce a discontinuity -- it only chooses where the
+                // stream starts. ffmpeg's startup delivers a lump (measured ~700 ms) and without
+                // this the session carries it as delay for as long as the caller keeps talking.
+                if (this.queuedBytes >= leadBytes) {
+                    if (this.queuedBytes > leadBytes)
+                        this.take(this.queuedBytes - leadBytes);
                     primed = true;
+                }
                 filled++;
             }
 
             await driver.write(frame);
 
+            // Hold the EXACT frame period on average. Small lateness (a slow socket write, a
+            // late timer) must NOT reset the schedule: doing so makes the period
+            // "frameMs + processing time", so the sink runs permanently slower than real time,
+            // the backlog grows for the whole session, and the device is fed slower than it
+            // plays. Measured that way: a 6 s tone ended with a 704 ms backlog, heard as audio
+            // that started loud, went quiet, then garbled.
+            //
+            // Only a gross gap resyncs -- a suspended process or a device that blocked for
+            // longer than any catch-up could sensibly cover.
             nextDue += frameMs;
             const slack = nextDue - Date.now();
             if (slack > 0) {
                 const paced = Promise.withResolvers<void>();
                 setTimeout(paced.resolve, slack);
                 await paced.promise;
-            } else {
+            } else if (slack < -RESYNC_THRESHOLD_MS) {
                 nextDue = Date.now();
             }
         }
-        if (filled)
-            this.console.log(`intercom: ${(filled * frameMs).toFixed(0)} ms sent as silence`
-                + ` (${stalls} source stall(s) after the opening lead)`);
+        const bytesPerMs = sampleRate * 2 / 1000;
+        const summary = `${driver.name} @ ${host}: ${(filled * frameMs).toFixed(0)} ms silence `
+            + `(${stalls} stall(s)), queue peak ${(this.peakQueuedBytes / bytesPerMs).toFixed(0)} ms, `
+            + `${(this.droppedBytes / bytesPerMs).toFixed(0)} ms dropped, lead ${leadMs} ms, `
+            + `frames ${frameMs.toFixed(0)} ms, OUR LATENCY avg `
+            + `${this.ageSamples ? (this.ageSumMs / this.ageSamples).toFixed(0) : '0'} ms / peak `
+            + `${this.peakAgeMs} ms`;
+        this.console.log(`intercom: session ended -- ${summary}`);
+        this.report(summary);
     }
 
+    /** Pulls `bytes` off the queue, recording how stale the oldest of it was.
+     *
+     * That staleness is this pipeline's own contribution to mouth-to-speaker delay: the gap
+     * between ffmpeg handing us audio and this process putting it on the wire. Everything else in
+     * the chain (the caller's device and network, ffmpeg's internal buffering, the device's own
+     * playback buffer) is outside it, so separating them requires measuring this part directly --
+     * a microphone cannot, because these devices echo-cancel adaptively. */
     private take(bytes: number): Buffer {
         const parts: Buffer[] = [];
         let need = bytes;
+        if (this.queue.length) {
+            const age = Date.now() - this.queue[0].at;
+            this.ageSumMs += age;
+            this.ageSamples++;
+            if (age > this.peakAgeMs)
+                this.peakAgeMs = age;
+        }
         while (need > 0) {
             const head = this.queue[0];
-            if (head.length <= need) {
-                parts.push(head);
+            if (head.chunk.length <= need) {
+                parts.push(head.chunk);
                 this.queue.shift();
-                need -= head.length;
+                need -= head.chunk.length;
             } else {
-                parts.push(head.subarray(0, need));
-                this.queue[0] = head.subarray(need);
+                parts.push(head.chunk.subarray(0, need));
+                this.queue[0] = { chunk: head.chunk.subarray(need), at: head.at };
                 need = 0;
             }
         }
@@ -261,6 +405,26 @@ function hasSoxr(ffmpegPath: string, console: Console): Promise<boolean> {
         });
     });
     return soxrProbe;
+}
+
+/** Whether a PCM chunk is quiet enough that dropping it cannot be heard.
+ *
+ * Used to make queue catch-up inaudible: the delay is recovered during the pauses a conversation
+ * naturally contains, instead of by cutting holes in speech. Sampled rather than fully summed --
+ * every fourth sample is plenty to distinguish a pause from a voice, and this runs on every
+ * chunk that arrives. */
+function isQuiet(pcm: Buffer): boolean {
+    const samples = Math.floor(pcm.length / 2);
+    if (!samples)
+        return true;
+    let sum = 0;
+    let counted = 0;
+    for (let i = 0; i < samples; i += 4) {
+        const v = pcm.readInt16LE(i * 2);
+        sum += v * v;
+        counted++;
+    }
+    return Math.sqrt(sum / counted) < QUIET_RMS;
 }
 
 export type { DriverConfig };

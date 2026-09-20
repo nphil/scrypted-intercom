@@ -12,9 +12,9 @@
 // does `useSHA256 = wwwAuthenticate.includes('encrypt_type="3"')` and therefore can never
 // authenticate against that camera. So: try what it advertises, then try the other one.
 //
-//   camera 1  C225  fw 1.3.1  advertises sha256, accepts sha256
-//   camera 2  C120  fw 1.9.2  advertises sha256, accepts sha256
-//   camera 3  C120  fw 1.4.3  advertises sha256, accepts MD5     <-- the liar
+//   10.0.0.13  C225  fw 1.3.1  advertises sha256, accepts sha256
+//   10.0.0.15  C120  fw 1.9.2  advertises sha256, accepts sha256
+//   10.0.0.14  C120  fw 1.4.3  advertises sha256, accepts MD5     <-- the liar
 //
 // No cloud contact occurs: the secret is a hash of the Tapo cloud password which the camera
 // verifies locally. The local camera-account credentials are not accepted by this endpoint.

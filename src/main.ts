@@ -28,7 +28,7 @@ import { FoscamDriver } from './drivers/foscam';
 import { OnvifBackchannelDriver } from './drivers/onvifBackchannel';
 import { ReolinkDriver } from './drivers/reolink';
 import { TapoDriver } from './drivers/tapo';
-import { CameraIntercomMixin } from './mixin';
+import { CameraIntercomMixin, DEFAULT_LEAD_MS, DEFAULT_WARMUP_MS } from './mixin';
 import { VendorPtzMixin } from './ptzMixin';
 import { sdk } from './sdkFix';
 import { runTalkbackSelfTest } from './selfTest';
@@ -45,6 +45,8 @@ const DEFAULTS: Record<string, string> = {
     backchannelRtspPort: '8554',
     backchannelRtspPath: 'sub',
     driverOverrides: '',
+    leadOverrides: '',
+    backchannelOverrides: '',
     selfTestCamera: '',
     selfTestRtspUsername: '',
     selfTestRtspPassword: '',
@@ -107,12 +109,60 @@ const SETTING_DEFS: Setting[] = [
         group: 'ONVIF Backchannel',
     },
     {
+        key: 'backchannelOverrides',
+        title: 'Backchannel Mount Overrides',
+        description: 'Optional, one per line as `host=port/path`, e.g. '
+            + '`10.0.0.50=554/h264Preview_01_sub`. The RTSP mount offering the sendonly audio '
+            + 'track differs per vendor, so a single global port/path can only serve one device. '
+            + 'Needed to point a camera at the standards-based path when its vendor protocol is '
+            + 'not the better choice: a Reolink doorbell offers PCMU/8000 here versus 16 kHz '
+            + 'ADPCM over Baichuan, and G.711 is 8 bits per sample against ADPCM\'s 4, so the '
+            + 'narrower path can be the cleaner one for speech.',
+        type: 'textarea',
+        group: 'ONVIF Backchannel',
+    },
+    {
         key: 'driverOverrides',
         title: 'Driver Overrides',
         description: 'Optional, one per line as `host=driver`, where driver is foscam, reolink, '
-            + 'tapo or onvif-backchannel. Only needed when autodetection guesses wrong; detection '
-            + 'is by port fingerprint and tries the standards-based backchannel first.',
+            + 'tapo or onvif-backchannel. Only needed when autodetection guesses wrong. Detection '
+            + 'is by port fingerprint and prefers a vendor protocol where one exists, because on '
+            + 'the hardware here the vendor path is the better one: a Reolink doorbell offers '
+            + 'PCMU/8000 on its ONVIF backchannel but 16 kHz ADPCM over Baichuan. Set '
+            + '`<host>=onvif-backchannel` to force the standards-based path.',
         type: 'textarea',
+        group: 'Advanced',
+    },
+    {
+        key: 'warmupMs',
+        title: 'Warm-Up Silence (ms)',
+        description: `Silence sent when a talk session opens, before any real audio (default `
+            + `${DEFAULT_WARMUP_MS}). Devices drop audio while their speaker path comes up, and `
+            + `this is what lands in that window instead of the caller's first words. Costs no `
+            + `added latency: it overlaps the transcoder's own startup.`,
+        type: 'number',
+        group: 'Advanced',
+    },
+    {
+        key: 'leadOverrides',
+        title: 'Lead Buffer Overrides',
+        description: 'Optional, one per line as `host=milliseconds`. The right lead depends on '
+            + "the CALLER's network, not the camera's, but it is bounded by how much latency a "
+            + 'given device is worth: a wired PoE doorbell answered from the Home app holds up at '
+            + '120 ms where a wifi camera wants the default. Measured here: both Reolink '
+            + 'doorbells are clean at 120 ms.',
+        type: 'textarea',
+        group: 'Advanced',
+    },
+    {
+        key: 'leadMs',
+        title: 'Lead Buffer (ms)',
+        description: `Audio held before real frames start flowing, and re-earned after a source `
+            + `stall (default ${DEFAULT_LEAD_MS}). This absorbs the lumpy first read from ffmpeg `
+            + `and jitter from the caller's own network. It IS added latency, so it is the first `
+            + `thing to trim for a wired device on a quiet LAN -- lower it until audio starts `
+            + `breaking up, then go back one step.`,
+        type: 'number',
         group: 'Advanced',
     },
     {
@@ -144,6 +194,18 @@ const SETTING_DEFS: Setting[] = [
         group: 'Self-Test',
     },
     { key: 'lastTalkbackTest', title: 'Last Talkback Test', readonly: true, type: 'textarea', group: 'Self-Test' },
+    {
+        key: 'lastSessions',
+        title: 'Recent Talk Sessions',
+        description: 'Newest first. `queue peak` is how much audio was waiting to be sent -- it is '
+            + 'latency the caller hears, and it should stay near the lead. A large peak means the '
+            + "source (HomeKit, the phone's network) delivered faster than real time; `dropped` is "
+            + 'what had to be discarded to stop that becoming a growing delay. `silence`/`stall(s)` '
+            + 'mean the opposite: the source had nothing ready.',
+        readonly: true,
+        type: 'textarea',
+        group: 'Self-Test',
+    },
 ];
 
 /** nativeId of the child mixin provider that supplies vendor pan/tilt. */
@@ -205,6 +267,18 @@ class CameraIntercomPlugin extends ScryptedDeviceBase implements DeviceProvider,
         return new CameraIntercomMixin(
             { mixinDevice, mixinDeviceInterfaces, mixinDeviceState, mixinProviderNativeId: this.nativeId },
             (host, console) => this.driverFor(host, console),
+            host => ({
+                warmupMs: Number(this.get('warmupMs')) || DEFAULT_WARMUP_MS,
+                leadMs: this.leadFor(host) ?? (Number(this.get('leadMs')) || DEFAULT_LEAD_MS),
+            }),
+            // Last few sessions, kept as a setting: the plugin console is not readable over the
+            // API, and attributing latency between this process, the caller's network and the
+            // device needs the numbers rather than an impression.
+            line => {
+                const stamp = new Date().toISOString().slice(11, 19);
+                const previous = (this.storage.getItem('lastSessions') ?? '').split('\n').filter(Boolean);
+                this.storage.setItem('lastSessions', [`${stamp}  ${line}`, ...previous].slice(0, 8).join('\n'));
+            },
         );
     }
 
@@ -239,14 +313,16 @@ class CameraIntercomPlugin extends ScryptedDeviceBase implements DeviceProvider,
                     cloudPassword: this.get('tapoCloudPassword'),
                     previousCloudPassword: this.get('tapoPreviousCloudPassword'),
                 });
-            case 'onvif-backchannel':
+            case 'onvif-backchannel': {
+                const mount = this.backchannelMountFor(host);
                 return new OnvifBackchannelDriver({
                     ...config,
                     username: this.get('backchannelUsername'),
                     password: this.get('backchannelPassword'),
-                    rtspPort: Number(this.get('backchannelRtspPort')),
-                    rtspPath: this.get('backchannelRtspPath'),
+                    rtspPort: mount?.port ?? Number(this.get('backchannelRtspPort')),
+                    rtspPath: mount?.path ?? this.get('backchannelRtspPath'),
                 });
+            }
         }
     }
 
@@ -259,6 +335,36 @@ class CameraIntercomPlugin extends ScryptedDeviceBase implements DeviceProvider,
             const [left, right] = line.split('=').map(part => part?.trim());
             if (left === host && right)
                 return right as DriverName;
+        }
+        return undefined;
+    }
+
+    /** Per-host RTSP mount for the backchannel, as `host=port/path`. */
+    private backchannelMountFor(host: string): { port: number; path: string } | undefined {
+        for (const line of this.get('backchannelOverrides').split('\n')) {
+            const [left, right] = line.split('=').map(part => part?.trim());
+            if (left !== host || !right)
+                continue;
+            const slash = right.indexOf('/');
+            const port = Number(slash === -1 ? right : right.slice(0, slash));
+            const path = slash === -1 ? this.get('backchannelRtspPath') : right.slice(slash + 1);
+            if (Number.isFinite(port) && port > 0 && path)
+                return { port, path };
+            this.console.warn(`intercom: ignoring backchannel override "${line.trim()}": expected host=port/path`);
+        }
+        return undefined;
+    }
+
+    /** Per-host lead buffer, for devices worth a tighter one than the global default. */
+    private leadFor(host: string): number | undefined {
+        for (const line of this.get('leadOverrides').split('\n')) {
+            const [left, right] = line.split('=').map(part => part?.trim());
+            if (left === host && right) {
+                const ms = Number(right);
+                if (Number.isFinite(ms) && ms >= 0)
+                    return ms;
+                this.console.warn(`intercom: ignoring lead override "${line.trim()}": not a number`);
+            }
         }
         return undefined;
     }

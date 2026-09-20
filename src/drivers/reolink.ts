@@ -5,8 +5,10 @@
 // RLC-833A: v3.1.0.3016 is the last build for hardware IPC_523D88MP. See
 // protocols/baichuan.ts for the framing and the two header rules that had to be traced.
 
+import type { PanTiltZoomCapabilities, PanTiltZoomCommand } from '@scrypted/sdk';
 import { ImaDviEncoder } from '../protocols/adpcm';
 import { BaichuanClient, talkFullBlockSize } from '../protocols/baichuan';
+import { ReolinkCgi } from '../protocols/reolinkCgi';
 import { DriverConfig, IntercomDriver, TalkFormat } from './driver';
 
 /** Blocks per cmd 202 message. neolink groups four, which at this camera's block size is a
@@ -89,4 +91,37 @@ export class ReolinkDriver implements IntercomDriver {
         await client.stopTalk().catch(e => this.config.console.warn('reolink: stopTalk failed:', e.message));
         client.close();
     }
+    /** Zoom, over the CGI. This camera has no pan or tilt -- it reports `{pan:false, tilt:false,
+     * zoom:true}` and that matches the hardware.
+     *
+     * Present here because Scrypted's `ONVIF PTZ` mixin is a DEAD capability on this model: it
+     * accepts a command, returns success, and the lens does not move. Verified against the
+     * camera's own zoom readback (21 before, 21 after), where the same move over the CGI went
+     * 4 -> 21. It also accepts pan commands on a camera that reports no pan, which is the
+     * giveaway. */
+    async ptzCapabilities(): Promise<PanTiltZoomCapabilities> {
+        return { pan: false, tilt: false, zoom: true };
+    }
+
+    async ptzCommand(command: PanTiltZoomCommand): Promise<void> {
+        if (!command.zoom) {
+            if (command.pan || command.tilt)
+                throw new Error('reolink: this camera has no pan or tilt, only zoom');
+            return;
+        }
+        const cgi = new ReolinkCgi({
+            host: this.config.host,
+            username: this.config.username,
+            password: this.config.password,
+            console: this.config.console,
+        });
+        const before = await cgi.zoomPosition().catch(() => undefined);
+        await cgi.zoom(command.zoom);
+        const after = await cgi.zoomPosition().catch(() => undefined);
+        // Logged because a PTZ command that silently does nothing is exactly the failure this
+        // replaces; the readback makes it visible without anyone watching the picture.
+        this.config.console.log(`reolink: zoom ${command.zoom > 0 ? '+' : ''}${command.zoom} `
+            + `moved position ${before ?? '?'} -> ${after ?? '?'}`);
+    }
+
 }
